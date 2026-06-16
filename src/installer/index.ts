@@ -3,7 +3,7 @@
  *
  * Multi-target: writes MCP server config + instructions for the
  * agents the user picks (Claude Code, Cursor, Codex CLI, opencode,
- * Hermes Agent).
+ * Hermes Agent, Gemini CLI, Antigravity IDE).
  * Defaults to the Claude-only behavior for backwards compatibility
  * when no targets are explicitly chosen and nothing else is detected.
  *
@@ -21,13 +21,15 @@ import {
   getTarget,
   resolveTargetFlag,
 } from './targets/registry';
-import type { AgentTarget, Location, TargetId, WriteResult } from './targets/types';
+import type { AgentTarget, Location, TargetId } from './targets/types';
 import { getGlyphs } from '../ui/glyphs';
 // Import the lightweight submodules directly (not the ../sync barrel, which
 // re-exports FileWatcher and would transitively pull in ../extraction — the
 // installer must stay importable even when native modules can't load).
 import { watchDisabledReason } from '../sync/watch-policy';
 import { isGitRepo, isSyncHookInstalled, installGitSyncHook } from '../sync/git-hooks';
+import { getCodeGraphDir, codeGraphDirName, unsafeIndexRootReason } from '../directory';
+import { getTelemetry, recordIndexEvent, TELEMETRY_DOCS } from '../telemetry';
 
 // Backwards-compat: keep these named exports — downstream code may
 // import them. The shim in `config-writer.ts` continues to re-export
@@ -35,10 +37,8 @@ import { isGitRepo, isSyncHookInstalled, installGitSyncHook } from '../sync/git-
 export {
   writeMcpConfig,
   writePermissions,
-  writeClaudeMd,
   hasMcpConfig,
   hasPermissions,
-  hasClaudeMdSection,
 } from './config-writer';
 export type { InstallLocation } from './config-writer';
 
@@ -119,7 +119,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       const s = clack.spinner();
       s.start('Installing codegraph CLI...');
       try {
-        execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe' });
+        execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe', windowsHide: true });
         s.stop('Installed codegraph CLI on PATH');
       } catch {
         s.stop('Could not install (permission denied)');
@@ -182,7 +182,33 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     autoAllow = false;
   }
 
+  // Step 4½: anonymous usage telemetry — a visible default-on toggle, asked
+  // exactly once. Skipped when an env var (DO_NOT_TRACK / CODEGRAPH_TELEMETRY)
+  // already decides, or when a previous run stored a choice — re-runs and
+  // upgrades never re-ask.
+  if (!useDefaults && getTelemetry().getStatus().decidedBy === 'default' && !getTelemetry().hasStoredChoice()) {
+    const share = await clack.confirm({
+      message: 'Share anonymous usage stats? (No code, paths, or names — see TELEMETRY.md)',
+      initialValue: true,
+    });
+    if (clack.isCancel(share)) {
+      // Don't kill the install over the telemetry question — leave it
+      // undecided (the documented default + first-run notice applies later).
+      clack.log.info('Skipped — manage anytime with `codegraph telemetry on|off`.');
+    } else {
+      getTelemetry().setEnabled(share, 'installer');
+      clack.log.info(
+        share
+          ? `Thanks! Exactly what is collected: ${TELEMETRY_DOCS}`
+          : 'Telemetry disabled — nothing will be collected or sent.',
+      );
+    }
+  }
+
   // Step 5: per-target install loop.
+  const installedIds: TargetId[] = [];
+  let sawCreated = false;
+  let sawUpdated = false;
   for (const target of targets) {
     if (!target.supportsLocation(location)) {
       clack.log.warn(
@@ -191,15 +217,30 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       continue;
     }
     const result = target.install(location, { autoAllow });
+    installedIds.push(target.id);
     for (const file of result.files) {
+      if (file.action === 'created') sawCreated = true;
+      if (file.action === 'updated') sawUpdated = true;
       const verb = file.action === 'unchanged'
         ? 'Unchanged'
-        : file.action === 'created' ? 'Created' : 'Updated';
+        : file.action === 'created' ? 'Created'
+          : file.action === 'removed' ? 'Removed'
+            : 'Updated';
       clack.log.success(`${target.displayName}: ${verb} ${tildify(file.path)}`);
     }
     for (const note of result.notes ?? []) {
       clack.log.info(`${target.displayName}: ${note}`);
     }
+  }
+
+  // Telemetry: which agents were configured, where, fresh-vs-upgrade (derived
+  // from the file actions above). Target IDs and the location enum only.
+  if (installedIds.length > 0) {
+    getTelemetry().recordLifecycle('install', {
+      targets: installedIds,
+      scope: location,
+      kind: sawCreated ? 'fresh' : sawUpdated ? 'upgrade' : 'reinstall',
+    });
   }
 
   // Step 6: for local install, initialize the project.
@@ -210,6 +251,10 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
   if (location === 'global') {
     clack.note('cd your-project\ncodegraph init -i', 'Quick start');
   }
+
+  // Deliver buffered telemetry while we're already in a long interactive
+  // command — bounded (~1.5s worst case), invisible after a multi-second install.
+  await getTelemetry().flushNow();
 
   const finalNote = targets.length > 0
     ? `Done! Restart your agent${targets.length > 1 ? 's' : ''} to use CodeGraph.`
@@ -317,8 +362,8 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
     const sel = await clack.select({
       message: 'Remove CodeGraph from all your projects, or just this one?',
       options: [
-        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes' },
-        { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./opencode.jsonc' },
+        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro' },
+        { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./opencode.jsonc, ./.gemini, ./.kiro' },
       ],
       initialValue: 'global' as const,
     });
@@ -362,8 +407,15 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
 
   // Step 4: for local uninstall, the index dir is separate — point at
   // `uninit` so the user knows it's still there (and how to remove it).
-  if (location === 'local' && fs.existsSync(path.join(process.cwd(), '.codegraph'))) {
-    clack.log.info('The .codegraph/ index for this project is still here. Run `codegraph uninit` to delete it.');
+  if (location === 'local' && fs.existsSync(getCodeGraphDir(process.cwd()))) {
+    clack.log.info(`The ${codeGraphDirName()}/ index for this project is still here. Run \`codegraph uninit\` to delete it.`);
+  }
+
+  // Telemetry churn signal (agent IDs only) — flush now, since after an
+  // uninstall there is usually no "next run" to deliver it.
+  if (removed.length > 0) {
+    getTelemetry().recordLifecycle('uninstall', { targets: removed.map((r) => r.id) });
+    await getTelemetry().flushNow();
   }
 
   // Step 5: summary.
@@ -376,38 +428,6 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
   } else {
     clack.outro(`CodeGraph was not configured in any ${location} agent — nothing to remove.`);
   }
-}
-
-/**
- * For every target that has a global config and exposes
- * `wireProjectSurfaces`, write its project-local surfaces (e.g.
- * Cursor's `.cursor/rules/codegraph.mdc`). Idempotent — runs
- * silently when there's nothing to write.
- *
- * Called by `codegraph init` so that a user who ran
- * `codegraph install` once globally doesn't have to re-run it per
- * project to get full agent support.
- *
- * Returns the list of `(target, file)` pairs that were created or
- * updated — caller decides how to surface them.
- */
-export function wireProjectSurfacesForGlobalAgents(): Array<{
-  target: AgentTarget;
-  file: WriteResult['files'][number];
-}> {
-  const written: Array<{ target: AgentTarget; file: WriteResult['files'][number] }> = [];
-  for (const target of ALL_TARGETS) {
-    if (typeof target.wireProjectSurfaces !== 'function') continue;
-    const detection = target.detect('global');
-    if (!detection.alreadyConfigured) continue;
-    const result = target.wireProjectSurfaces();
-    for (const file of result.files) {
-      if (file.action === 'created' || file.action === 'updated') {
-        written.push({ target, file });
-      }
-    }
-  }
-  return written;
 }
 
 /**
@@ -481,6 +501,18 @@ async function initializeLocalProject(
 ): Promise<void> {
   const projectPath = process.cwd();
 
+  // Never auto-index the home directory or a filesystem root. Running the
+  // installer from `$HOME` would otherwise index the entire home tree — a
+  // multi-GB index, constant watcher churn, and (pre-1.0 on macOS) fd
+  // exhaustion that crashed the machine (#845). The install itself still
+  // completes; we just skip the auto-index and point them at a real project.
+  const unsafe = unsafeIndexRootReason(projectPath);
+  if (unsafe) {
+    clack.log.warn(`Skipping automatic indexing — ${projectPath} looks like ${unsafe}.`);
+    clack.log.info('Indexing it would pull in caches, other projects, and your whole tree. Run "codegraph init" inside a specific project instead.');
+    return;
+  }
+
   let CodeGraph: typeof import('../index').default;
   try {
     CodeGraph = (await import('../index')).default;
@@ -518,6 +550,8 @@ async function initializeLocalProject(
   } else {
     clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files (${formatNumber(result.nodesCreated)} symbols)`);
   }
+
+  recordIndexEvent(cg, result); // buffered; the installer flushes at the end
 
   cg.close();
 
