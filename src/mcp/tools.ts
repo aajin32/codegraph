@@ -134,7 +134,7 @@ export interface ExploreOutputBudget {
   maxCharsPerFile: number;
   /** Cluster gap threshold in lines — tighter clustering on small projects. */
   gapThreshold: number;
-  /** Max symbols listed in the per-file header (`#### path — sym(kind), ...`). */
+  /** Max symbols listed in the per-file header (``**`path`** — sym(kind), ...``). */
   maxSymbolsInFileHeader: number;
   /** Max edges shown per relationship kind in the Relationships section. */
   maxEdgesPerRelationshipKind: number;
@@ -289,6 +289,27 @@ function adaptiveExploreEnabled(): boolean {
 }
 
 /**
+ * How long the FIRST tool call waits on the post-open catch-up reconcile before
+ * giving up and serving anyway (issue #905). On a normal repo the reconcile
+ * finishes in well under this, so the gate is fully honored and nothing changes.
+ * On a very large repo (~100k files) the reconcile takes minutes — blocking the
+ * first call on all of it presents as a multi-minute hang — so we wait briefly
+ * for a clean answer, then serve and let the reconcile finish in the background
+ * (it yields to the event loop, so a concurrent read still runs).
+ *
+ * `CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS` overrides the default; `0` restores the
+ * old unbounded-wait behavior (always block until the reconcile completes).
+ */
+const DEFAULT_CATCHUP_GATE_TIMEOUT_MS = 3000;
+function resolveCatchUpGateTimeoutMs(): number {
+  const raw = process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS;
+  if (raw === undefined || raw === '') return DEFAULT_CATCHUP_GATE_TIMEOUT_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_CATCHUP_GATE_TIMEOUT_MS;
+  return Math.floor(n);
+}
+
+/**
  * Prefix each line of a source slice with its 1-based line number, matching
  * the Read tool's `cat -n` convention (number + tab) so the agent treats it
  * the same way it treats Read output.
@@ -303,6 +324,23 @@ function numberSourceLines(slice: string, firstLineNumber: number): string {
     out.push(`${firstLineNumber + i}\t${split[i]}`);
   }
   return out.join('\n');
+}
+
+/**
+ * Unique line-prefix for a per-file source section in codegraph_explore output.
+ * Issue #778: tool results dropped ATX headings (`####`, `##`, `###`) for bold
+ * labels so Markdown-rendering MCP clients (e.g. the Claude Code VSCode
+ * extension) stop blowing every header up to H1–H4. The path is bold + a code
+ * span so it still reads as a header, and the leading ``**` `` stays a UNIQUE,
+ * greppable marker — no other explore line begins with it — that the explore
+ * truncation boundary (`handleExplore`) and the offload chunker
+ * (`reasoning/reasoner.ts`) both key off to cut on whole file sections.
+ */
+const FILE_SECTION_PREFIX = '**`';
+function fileSectionHeader(filePath: string, suffix: string): string {
+  return suffix
+    ? `${FILE_SECTION_PREFIX}${filePath}\`** — ${suffix}`
+    : `${FILE_SECTION_PREFIX}${filePath}\`**`;
 }
 
 /**
@@ -667,7 +705,9 @@ export class ToolHandler {
   // this, a tool call that races past `catchUpSync()` serves rows for files
   // that were deleted (or edited) while no MCP server was running — and the
   // per-file staleness banner can't help, because `getPendingFiles()` is
-  // populated by the watcher, not by catch-up. Cleared on first await so
+  // populated by the watcher, not by catch-up. The wait is time-boxed
+  // (see {@link resolveCatchUpGateTimeoutMs}) so a minutes-long reconcile on a
+  // huge repo can't hang the first call (#905); cleared on first await so
   // subsequent calls don't pay any cost.
   private catchUpGate: Promise<void> | null = null;
 
@@ -689,6 +729,43 @@ export class ToolHandler {
    */
   setCatchUpGate(p: Promise<void> | null): void {
     this.catchUpGate = p;
+  }
+
+  /**
+   * Await the catch-up gate, but no longer than the configured timeout (#905).
+   * If the reconcile settles first, we got the fully-reconciled answer. If the
+   * timeout wins, we serve the call now and let the reconcile finish in the
+   * background — it yields to the event loop (see SYNC_RECONCILE_YIELD_INTERVAL),
+   * so a concurrent read still runs against the same connection. Never throws:
+   * a failed reconcile is logged by the engine, and we serve best-effort over
+   * the same potentially-stale data the un-gated path would have.
+   */
+  private async awaitCatchUpGate(gate: Promise<void>): Promise<void> {
+    const timeoutMs = resolveCatchUpGateTimeoutMs();
+    if (timeoutMs <= 0) {
+      // 0 = opt back into the original unbounded wait.
+      try { await gate; } catch { /* engine already logged */ }
+      return;
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const timedOut = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), timeoutMs);
+      timer.unref?.();
+    });
+    try {
+      const outcome = await Promise.race([
+        gate.then(() => 'done' as const, () => 'done' as const),
+        timedOut,
+      ]);
+      if (outcome === 'timeout') {
+        process.stderr.write(
+          `[CodeGraph MCP] Catch-up reconcile still running after ${timeoutMs}ms; serving this tool call now and finishing the reconcile in the background (#905). ` +
+          `Set CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS=0 to always wait for it.\n`
+        );
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /**
@@ -1128,13 +1205,16 @@ export class ToolHandler {
     try {
       // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
-      // running. The gate is cleared after first await — subsequent calls
-      // pay nothing. Catch-up failures are logged by the engine; we
-      // proceed regardless so a transient sync error never breaks tools.
+      // running. The wait is time-boxed (#905): a huge-repo reconcile takes
+      // minutes, and blocking the first call on all of it reads as a hang, so
+      // we wait briefly then serve and let it finish in the background. The
+      // gate is cleared after first await — subsequent calls pay nothing.
+      // Catch-up failures are logged by the engine; we proceed regardless so a
+      // transient sync error never breaks tools.
       if (this.catchUpGate) {
         const gate = this.catchUpGate;
         this.catchUpGate = null;
-        try { await gate; } catch { /* engine already logged */ }
+        await this.awaitCatchUpGate(gate);
       }
       // Honor the optional tool allowlist (CODEGRAPH_MCP_TOOLS): a trimmed
       // surface rejects ablated tools defensively even if a client cached them.
@@ -1287,7 +1367,7 @@ export class ToolHandler {
   private definitionHeading(group: Node[]): string {
     const head = group[0]!;
     const line = head.startLine ? `:${head.startLine}` : '';
-    return `### ${head.qualifiedName} (${head.kind}) — ${head.filePath}${line}`;
+    return `**${head.qualifiedName}** (${head.kind}) — ${head.filePath}${line}`;
   }
 
   /**
@@ -1345,7 +1425,7 @@ export class ToolHandler {
     // agent never mistakes one app's callers for another's. Narrow with
     // `file` to focus a single definition.
     const lines: string[] = [
-      `## Callers of ${symbol} — ${groups.length} distinct definitions (narrow with \`file\`)`,
+      `**Callers of ${symbol} — ${groups.length} distinct definitions (narrow with \`file\`)**`,
     ];
     for (const group of groups) {
       const { callers, labels } = collect(group);
@@ -1415,7 +1495,7 @@ export class ToolHandler {
 
     // Multiple DISTINCT definitions (#764): per-definition sections.
     const lines: string[] = [
-      `## Callees of ${symbol} — ${groups.length} distinct definitions (narrow with \`file\`)`,
+      `**Callees of ${symbol} — ${groups.length} distinct definitions (narrow with \`file\`)**`,
     ];
     for (const group of groups) {
       const { callees, labels } = collect(group);
@@ -1484,7 +1564,7 @@ export class ToolHandler {
     // merging unrelated same-named classes (one UserService per monorepo app)
     // overstated impact and confused agents. Narrow with `file`.
     const sections: string[] = [
-      `## Impact of ${symbol} — ${groups.length} distinct definitions (each with its own blast radius; narrow with \`file\`)`,
+      `**Impact of ${symbol} — ${groups.length} distinct definitions (each with its own blast radius; narrow with \`file\`)**`,
     ];
     for (const group of groups) {
       const head = group[0]!;
@@ -1560,6 +1640,22 @@ export class ToolHandler {
       return {
         label: `closure collection — runs handlers appended to ${field} (dynamic dispatch)`,
         compact: `dynamic: runs ${field} handlers${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'fn-pointer-dispatch') {
+      const via = m.via ? `\`${String(m.via)}\`` : 'a function pointer';
+      return {
+        label: `function-pointer dispatch via ${via} (dynamic dispatch)`,
+        compact: `dynamic: fn-pointer ${m.via ? String(m.via) : ''}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'goframe-route') {
+      const route = m.route ? `\`${String(m.route)}\`` : 'a route';
+      return {
+        label: `GoFrame route ${route} — reflective Bind → controller method (dynamic dispatch)`,
+        compact: `dynamic: GoFrame route ${m.route ? String(m.route) : ''}${at}`,
         registeredAt,
       };
     }
@@ -1702,7 +1798,7 @@ export class ToolHandler {
         if (synthLines.length === 0 && !boundaries) return EMPTY;
         const out: string[] = [];
         if (synthLines.length) out.push(
-          '## Dynamic-dispatch links among your symbols',
+          '**Dynamic-dispatch links among your symbols**',
           '(synthesized — the indirect hops grep/Read would reconstruct; the `@file:line` is the wiring site)',
           '', ...synthLines, '');
         if (boundaries) out.push(boundaries);
@@ -1817,7 +1913,7 @@ export class ToolHandler {
       if (!hasMain && synthLines.length === 0 && !boundaryText && !polyText) return EMPTY;
       const out: string[] = [];
       if (hasMain) {
-        out.push('## Flow (call path among the symbols you queried)', '');
+        out.push('**Flow (call path among the symbols you queried)**', '');
         for (let i = 0; i < best!.length; i++) {
           const step = best![i]!;
           if (step.edge) { const sy = this.synthEdgeNote(step.edge); out.push(`   ↓ ${sy ? sy.compact : step.edge.kind}`); }
@@ -1827,7 +1923,7 @@ export class ToolHandler {
       }
       if (synthLines.length) {
         out.push(
-          '## Dynamic-dispatch links among your symbols',
+          '**Dynamic-dispatch links among your symbols**',
           '(synthesized — the indirect hops grep/Read would reconstruct; the `@file:line` is the wiring site)',
           '',
           ...synthLines,
@@ -1895,7 +1991,7 @@ export class ToolHandler {
     }
     if (notes.length === 0) return '';
     return [
-      '## Dynamic boundaries (the static path ends at runtime dispatch)',
+      '**Dynamic boundaries (the static path ends at runtime dispatch)**',
       '',
       ...notes,
       '',
@@ -1982,7 +2078,7 @@ export class ToolHandler {
     }
     if (notes.length === 0) return '';
     return [
-      '## Interface dispatch (a named method has many implementations)',
+      '**Interface dispatch (a named method has many implementations)**',
       '',
       ...notes,
       '',
@@ -2111,7 +2207,7 @@ export class ToolHandler {
     if (entries.length === 0) return '';
 
     return [
-      '### Blast radius — what depends on these (update/verify before editing)',
+      '**Blast radius — what depends on these (update/verify before editing)**',
       '',
       ...entries,
       '',
@@ -2580,7 +2676,7 @@ export class ToolHandler {
 
     // Step 3: Build relationship map
     const lines: string[] = [
-      `## Exploration: ${query}`,
+      `**Exploration: ${query}**`,
       '',
       `Found ${subgraph.nodes.size} symbols across ${fileGroups.size} files.`,
       '',
@@ -2598,7 +2694,7 @@ export class ToolHandler {
     );
 
     if (budget.includeRelationships && significantEdges.length > 0) {
-      lines.push('### Relationships');
+      lines.push('**Relationships**');
       lines.push('');
 
       // Group edges by kind for readability
@@ -2685,7 +2781,7 @@ export class ToolHandler {
       return false;
     };
 
-    lines.push('### Source Code');
+    lines.push('**Source Code**');
     lines.push('');
     lines.push('> The code below is the **verbatim, current on-disk source** of these files — re-read from disk on this call and line-numbered, byte-for-byte identical to what the Read tool returns. It is NOT a summary, outline, or stale cache. Treat each block as a Read you have already performed: do not Read a file shown here.');
     lines.push('');
@@ -2829,7 +2925,7 @@ export class ToolHandler {
           const tag = bodyIds.size > 0
             ? 'focused (the methods you named in full, the rest as signatures — codegraph_explore a signature by name for its body; do NOT Read)'
             : 'skeleton (signatures only — codegraph_explore a name for its full body; do NOT Read)';
-          lines.push(`#### ${filePath} — ${names} · ${tag}`, '', '```' + lang, skel.join('\n'), '```', '');
+          lines.push(fileSectionHeader(filePath, `${names} · ${tag}`), '', '```' + lang, skel.join('\n'), '```', '');
           totalChars += skel.join('\n').length + 120;
           filesIncluded++;
           continue;
@@ -2870,7 +2966,7 @@ export class ToolHandler {
         )];
         const headerNames = uniqSymbols.slice(0, budget.maxSymbolsInFileHeader);
         const omitted = uniqSymbols.length - headerNames.length;
-        const wholeHeader = `#### ${filePath} — ${omitted > 0 ? `${headerNames.join(', ')}, +${omitted} more` : headerNames.join(', ')}`;
+        const wholeHeader = fileSectionHeader(filePath, omitted > 0 ? `${headerNames.join(', ')}, +${omitted} more` : headerNames.join(', '));
 
         if (!fileNecessary && totalChars + wholeSection.length + 200 > budget.maxOutputChars) {
           // Don't slice a whole file mid-method: an incidental file that doesn't
@@ -3137,7 +3233,7 @@ export class ToolHandler {
       const headerSuffix = omittedCount > 0
         ? `${headerSymbols.join(', ')}, +${omittedCount} more`
         : headerSymbols.join(', ');
-      const fileHeader = `#### ${filePath} — ${headerSuffix}`;
+      const fileHeader = fileSectionHeader(filePath, headerSuffix);
 
       // The total cap bounds INCIDENTAL files only. A file that DEFINES a symbol
       // the agent named (or that's on the flow spine) renders even when the
@@ -3178,7 +3274,7 @@ export class ToolHandler {
         .sort((a, b) => b[1].score - a[1].score);
       const remainingFiles = [...remainingRelevant, ...peripheralFiles];
       if (remainingFiles.length > 0) {
-        lines.push('### Not shown above — explore these names for their source');
+        lines.push('**Not shown above — explore these names for their source**');
         lines.push('');
         for (const [filePath, group] of remainingFiles.slice(0, 10)) {
           const symbols = group.nodes.map(n => `${n.name}:${n.startLine}`).join(', ');
@@ -3227,13 +3323,13 @@ export class ToolHandler {
 
     const hardCeiling = Math.min(Math.round(budget.maxOutputChars * 1.5), 25000);
     if (output.length > hardCeiling) {
-      // Cut at a FILE-SECTION boundary (the last `#### ` header before the
+      // Cut at a FILE-SECTION boundary (the last ``**` `` file header before the
       // ceiling) so we drop whole trailing file-sections rather than slicing
       // through a method body — a half-rendered method just forces the Read this
       // tool exists to prevent. Fall back to a line boundary only if no section
       // header sits in the back half (degenerate single-giant-section case).
       const cut = output.slice(0, hardCeiling);
-      const lastSection = cut.lastIndexOf('\n#### ');
+      const lastSection = cut.lastIndexOf('\n' + FILE_SECTION_PREFIX);
       const boundary = lastSection > hardCeiling * 0.5 ? lastSection : cut.lastIndexOf('\n');
       const safe = boundary > 0 ? cut.slice(0, boundary) : cut;
       return this.textResult(safe + '\n\n... (output truncated to budget; the source above is complete and verbatim — treat it as already Read. For any area not covered, run another codegraph_explore with the specific names — do NOT Read these files.)');
@@ -3348,7 +3444,7 @@ export class ToolHandler {
       const shownList = listed.slice(0, LIST_CAP);
       out.push(
         '',
-        '### Other definitions',
+        '**Other definitions**',
         ...shownList.map((n) => `- \`${n.name}\` (${n.kind}) — ${n.filePath}:${n.startLine}`),
       );
       if (listed.length > LIST_CAP) out.push(`- … +${listed.length - LIST_CAP} more`);
@@ -3430,7 +3526,7 @@ export class ToolHandler {
     // symbolsOnly → the cheap structural overview, no source.
     if (opts.symbolsOnly) {
       const out = [`**${filePath}** — ${nodes.length} symbol${nodes.length === 1 ? '' : 's'}, ${depSummary}`, ''];
-      if (nodes.length) out.push(...symbolMap('### Symbols'));
+      if (nodes.length) out.push(...symbolMap('**Symbols**'));
       else out.push('_No indexed symbols in this file._');
       out.push('', '> Drop `symbolsOnly` (or pass `offset`/`limit`) to read the source, like Read.');
       return this.textResult(this.truncateOutput(out.join('\n')));
@@ -3440,7 +3536,7 @@ export class ToolHandler {
     // line is `key: <secret>`. Summarize by key and point to a real Read.
     if (CONFIG_LEAF_LANGUAGES.has(resolved.language)) {
       const out = [`**${filePath}** — configuration/data file, ${depSummary}`, ''];
-      if (nodes.length) out.push(...symbolMap('### Keys (values withheld for safety)'));
+      if (nodes.length) out.push(...symbolMap('**Keys (values withheld for safety)**'));
       out.push('', '> Values may be secrets, so codegraph indexes keys only. Read the file directly if you need a value.');
       return this.textResult(this.truncateOutput(out.join('\n')));
     }
@@ -3454,7 +3550,7 @@ export class ToolHandler {
     }
     if (content === null) {
       const out = [`**${filePath}** — could not read from disk (it may have moved since indexing). ${depSummary}`, ''];
-      if (nodes.length) out.push(...symbolMap('### Symbols'));
+      if (nodes.length) out.push(...symbolMap('**Symbols**'));
       out.push('', `> Read \`${filePath}\` directly for its current content.`);
       return this.textResult(this.truncateOutput(out.join('\n')));
     }
@@ -3551,7 +3647,7 @@ export class ToolHandler {
     const callees = collect(cg.getCallees(node.id));
     const callers = collect(cg.getCallers(node.id));
     if (callees.length === 0 && callers.length === 0) return '';
-    const lines: string[] = ['', '### Trail — codegraph_node any of these to follow it (no Read needed)'];
+    const lines: string[] = ['', '**Trail — codegraph_node any of these to follow it (no Read needed)**'];
     if (callees.length > 0) {
       lines.push(`**Calls →** ${callees.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callees.length > TRAIL_CAP ? `, +${callees.length - TRAIL_CAP} more` : ''}`);
     }
@@ -3587,7 +3683,7 @@ export class ToolHandler {
     const mismatch = this.worktreeMismatchFor(args.projectPath as string | undefined);
 
     const lines: string[] = [
-      '## CodeGraph Status',
+      '**CodeGraph Status**',
       '',
     ];
     if (mismatch) {
@@ -3618,7 +3714,7 @@ export class ToolHandler {
       );
     }
 
-    lines.push('', '### Nodes by Kind:');
+    lines.push('', '**Nodes by Kind:**');
 
     for (const [kind, count] of Object.entries(stats.nodesByKind)) {
       if ((count as number) > 0) {
@@ -3626,7 +3722,7 @@ export class ToolHandler {
       }
     }
 
-    lines.push('', '### Languages:');
+    lines.push('', '**Languages:**');
     for (const [lang, count] of Object.entries(stats.filesByLanguage)) {
       if ((count as number) > 0) {
         lines.push(`- ${lang}: ${count}`);
@@ -3640,7 +3736,7 @@ export class ToolHandler {
     if (cg.isWatcherDegraded()) {
       lines.push(
         '',
-        '### Auto-sync disabled:',
+        '**Auto-sync disabled:**',
         `- ${cg.getWatcherDegradedReason() ?? 'live file watching stopped'}`,
         '- The index is frozen; Read files directly for current content.'
       );
@@ -3652,7 +3748,7 @@ export class ToolHandler {
     // banners on other tool calls.
     const pending = cg.getPendingFiles();
     if (pending.length > 0) {
-      lines.push('', '### Pending sync:');
+      lines.push('', '**Pending sync:**');
       const now = Date.now();
       for (const p of pending) {
         const ageMs = Math.max(0, now - p.lastSeenMs);
@@ -3743,7 +3839,7 @@ export class ToolHandler {
    * Format files as a flat list
    */
   private formatFilesFlat(files: { path: string; language: string; nodeCount: number }[], includeMetadata: boolean): string {
-    const lines: string[] = [`## Files (${files.length})`, ''];
+    const lines: string[] = [`**Files (${files.length})**`, ''];
 
     for (const file of files.sort((a, b) => a.path.localeCompare(b.path))) {
       if (includeMetadata) {
@@ -3768,13 +3864,13 @@ export class ToolHandler {
       byLang.set(file.language, existing);
     }
 
-    const lines: string[] = [`## Files by Language (${files.length} total)`, ''];
+    const lines: string[] = [`**Files by Language (${files.length} total)**`, ''];
 
     // Sort languages by file count (descending)
     const sortedLangs = [...byLang.entries()].sort((a, b) => b[1].length - a[1].length);
 
     for (const [lang, langFiles] of sortedLangs) {
-      lines.push(`### ${lang} (${langFiles.length})`);
+      lines.push(`**${lang} (${langFiles.length})**`);
       for (const file of langFiles.sort((a, b) => a.path.localeCompare(b.path))) {
         if (includeMetadata) {
           lines.push(`- ${file.path} (${file.nodeCount} symbols)`);
@@ -3826,7 +3922,7 @@ export class ToolHandler {
     }
 
     // Render tree
-    const lines: string[] = [`## Project Structure (${files.length} files)`, ''];
+    const lines: string[] = [`**Project Structure (${files.length} files)**`, ''];
 
     const renderNode = (node: TreeNode, prefix: string, isLast: boolean, depth: number): void => {
       if (maxDepth !== undefined && depth > maxDepth) return;
@@ -4039,13 +4135,13 @@ export class ToolHandler {
   // =========================================================================
 
   private formatSearchResults(results: SearchResult[]): string {
-    const lines: string[] = [`## Search Results (${results.length} found)`, ''];
+    const lines: string[] = [`**Search Results (${results.length} found)**`, ''];
 
     for (const result of results) {
       const { node } = result;
       const location = node.startLine ? `:${node.startLine}` : '';
       // Compact format: one line per result with key info
-      lines.push(`### ${node.name} (${node.kind})`);
+      lines.push(`**${node.name}** (${node.kind})`);
       lines.push(`${node.filePath}${location}`);
       if (node.signature) lines.push(`\`${node.signature}\``);
       lines.push('');
@@ -4055,7 +4151,7 @@ export class ToolHandler {
   }
 
   private formatNodeList(nodes: Node[], title: string, labels?: Map<string, string>): string {
-    const lines: string[] = [`## ${title} (${nodes.length} found)`, ''];
+    const lines: string[] = [`**${title} (${nodes.length} found)**`, ''];
 
     for (const node of nodes) {
       const location = node.startLine ? `:${node.startLine}` : '';
@@ -4090,7 +4186,7 @@ export class ToolHandler {
 
     // Compact format: just list affected symbols grouped by file
     const lines: string[] = [
-      `## Impact: "${symbol}" affects ${nodeCount} symbols`,
+      `**Impact: "${symbol}" affects ${nodeCount} symbols**`,
       '',
     ];
 
@@ -4138,7 +4234,7 @@ export class ToolHandler {
   private formatNodeDetails(node: Node, code: string | null, outline?: string | null): string {
     const location = node.startLine ? `:${node.startLine}` : '';
     const lines: string[] = [
-      `## ${node.name} (${node.kind})`,
+      `**${node.name}** (${node.kind})`,
       '',
       `**Location:** ${node.filePath}${location}`,
     ];
