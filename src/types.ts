@@ -95,6 +95,9 @@ export const LANGUAGES = [
   'twig',
   'xml',
   'properties',
+  'cfml',
+  'cfscript',
+  'cfquery',
   'unknown',
 ] as const;
 
@@ -408,6 +411,25 @@ export interface SearchResult {
 
   /** Matched text snippets for highlighting */
   highlights?: string[];
+}
+
+/**
+ * A symbol whose name-segments match prose words from a prompt — the
+ * graph-derived signal behind the front-load hook's medium tier
+ * (CodeGraph.getSegmentMatches). Always verified to exist in `nodes` at the
+ * time it is returned.
+ */
+export interface SegmentMatch {
+  /** Symbol name as indexed (e.g. `OrderStateMachine`). */
+  name: string;
+  /** Kind of the representative definition. */
+  kind: NodeKind;
+  /** File of the representative definition. */
+  filePath: string;
+  /** 1-based start line of the representative definition. */
+  startLine: number;
+  /** The prompt words (normalized) that matched this name's segments. */
+  matchedWords: string[];
 }
 
 // =============================================================================
