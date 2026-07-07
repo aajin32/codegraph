@@ -138,6 +138,18 @@ describe('Language Detection', () => {
     expect(detectLanguage('versions.tofu')).toBe('terraform');
   });
 
+  it('should detect ArkTS files', () => {
+    expect(detectLanguage('entry/src/main/ets/pages/Index.ets')).toBe('arkts');
+    // Plain `.ts` in a HarmonyOS project is still TypeScript.
+    expect(detectLanguage('entry/src/main/ets/common/utils.ts')).toBe('typescript');
+  });
+
+  it('should detect Nix files', () => {
+    expect(detectLanguage('default.nix')).toBe('nix');
+    expect(detectLanguage('pkgs/development/tools/misc/codegraph/default.nix')).toBe('nix');
+    expect(isSourceFile('default.nix')).toBe(true);
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
@@ -167,6 +179,146 @@ describe('Language Support', () => {
     expect(languages).toContain('kotlin');
     expect(languages).toContain('dart');
     expect(languages).toContain('solidity');
+    expect(languages).toContain('nix');
+  });
+});
+
+describe('Nix Extraction', () => {
+  it('should distinguish Nix variable and function bindings', () => {
+    const code = `
+let
+  plainValue = 10;
+  simpleFn = arg: arg + 1;
+  destructuredFn = { lib, stdenv }: lib.getName stdenv;
+  curriedFn = a: b: builtins.toString (a + b);
+in
+{
+  exportedValue = plainValue;
+  exportedFn = curriedFn;
+}
+`;
+
+    const result = extractFromSource('default.nix', code);
+
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'plainValue')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'exportedValue')).toBeDefined();
+
+    const simpleFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'simpleFn');
+    const destructuredFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'destructuredFn');
+    const curriedFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'curriedFn');
+
+    expect(simpleFn?.signature).toBe('(arg)');
+    expect(destructuredFn?.signature).toBe('{ lib, stdenv }');
+    expect(curriedFn?.signature).toBe('a : b');
+
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toContain('lib.getName');
+    expect(calls.filter((name) => name === 'builtins.toString')).toHaveLength(1);
+  });
+
+  it('should extract inherited Nix attributes as variables', () => {
+    const code = `
+let
+  inherit lib;
+  inherit (pkgs) stdenv writeShellScriptBin;
+in
+stdenv.mkDerivation {}
+`;
+
+    const result = extractFromSource('default.nix', code);
+    const variables = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+
+    expect(variables).toContain('lib');
+    expect(variables).toContain('stdenv');
+    expect(variables).toContain('writeShellScriptBin');
+  });
+
+  it('should emit only static project path imports for Nix import calls', () => {
+    const code = `
+let
+  local = import ./x.nix;
+  defaultFile = builtins.import ./dir;
+  packageSet = import <nixpkgs> {};
+  fromSources = import sources.nixpkgs {};
+  dynamic = import selectedPath;
+in
+local
+`;
+
+    const result = extractFromSource('default.nix', code);
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    const importRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+
+    expect(imports).toEqual(['./x.nix', './dir']);
+    expect(importRefs).toEqual(['./x.nix', './dir']);
+  });
+
+  it('should emit file imports for NixOS module imports/modules lists (literal paths only)', () => {
+    const code = `
+{ config, lib, ... }:
+{
+  imports = [ ./hardware.nix ../common inputs.foo.nixosModules.bar ];
+  home-manager.users.demo.imports = [ ./home.nix ];
+  flake.modules = [ ./configuration.nix ];
+  notAModuleList = [ ./ignored.nix ];
+}
+`;
+
+    const result = extractFromSource('configuration.nix', code);
+    const importRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+
+    expect(importRefs).toEqual(['./hardware.nix', '../common', './home.nix', './configuration.nix']);
+    // The dynamic entry (inputs.foo.nixosModules.bar) must not create a ref.
+    expect(importRefs).not.toContain('inputs.foo.nixosModules.bar');
+  });
+
+  it('should emit file imports for callPackage with a literal path and skip dynamic ones', () => {
+    const code = `
+{ pkgs, newScope }:
+let
+  hello = pkgs.callPackage ./pkgs/hello { };
+  tools = pkgs.callPackages ../tools/all.nix { };
+  dynamic = pkgs.callPackage pkgPath { };
+in
+{
+  inherit hello tools dynamic;
+}
+`;
+
+    const result = extractFromSource('overlay.nix', code);
+    const importRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+
+    expect(importRefs).toEqual(['./pkgs/hello', '../tools/all.nix']);
+    // The call edge to callPackage itself is still recorded.
+    expect(calls).toContain('pkgs.callPackage');
+  });
+
+  it('should mark returned top-level Nix attrset members exported and keep let or nested attrs private', () => {
+    const code = `
+{ lib, stdenv }:
+let
+  localValue = 10;
+in
+{
+  exported = localValue;
+  package = { name }: stdenv.mkDerivation { inherit name; };
+  nested = {
+    privateNested = true;
+  };
+  inherit (lib) licenses;
+}
+`;
+
+    const result = extractFromSource('default.nix', code);
+    const node = (name: string) => result.nodes.find((n) => n.name === name);
+
+    expect(node('localValue')?.isExported).toBe(false);
+    expect(node('exported')?.isExported).toBe(true);
+    expect(node('package')?.kind).toBe('function');
+    expect(node('package')?.isExported).toBe(true);
+    expect(node('privateNested')?.isExported).toBe(false);
+    expect(node('licenses')?.isExported).toBe(true);
   });
 });
 
@@ -10235,6 +10387,288 @@ resource "aws_instance" "x" {
       expect(refs.some((r) => r.startsWith('self.'))).toBe(false);
       expect(refs.some((r) => r.startsWith('path.'))).toBe(false);
       expect(refs.some((r) => r.startsWith('terraform.'))).toBe(false);
+    });
+  });
+});
+
+// =============================================================================
+// ArkTS (HarmonyOS / OpenHarmony declarative UI — `.ets`)
+// =============================================================================
+
+describe('ArkTS Extraction', () => {
+  it('reports ArkTS as supported', () => {
+    expect(isLanguageSupported('arkts')).toBe(true);
+    expect(getSupportedLanguages()).toContain('arkts');
+  });
+
+  describe('@Component struct extraction', () => {
+    const code = `
+import { TodoItem } from '../model/TodoItem';
+
+@Entry
+@Component
+struct Index {
+  @State message: string = 'Hello';
+  @Prop count: number = 0;
+  @StorageLink('theme') theme: string = 'light';
+  private service: TodoService = new TodoService();
+
+  aboutToAppear(): void {
+    this.load();
+  }
+
+  load(): void {
+    this.message = 'loaded';
+  }
+
+  build() {
+    Column() {
+      Text(this.message).fontSize(50)
+    }
+    .height('100%')
+  }
+}
+`;
+
+    it('extracts the struct with its ArkUI decorators', () => {
+      const result = extractFromSource('pages/Index.ets', code);
+      const comp = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Index');
+      expect(comp).toBeDefined();
+      expect(comp?.language).toBe('arkts');
+      expect(comp?.decorators).toEqual(expect.arrayContaining(['Entry', 'Component']));
+    });
+
+    it('extracts an EXPORTED struct whose decorators sit on the export statement', () => {
+      const result = extractFromSource(
+        'components/Card.ets',
+        `@Component\nexport struct Card {\n  build() {\n    Row() {}\n  }\n}\n`
+      );
+      const card = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Card');
+      expect(card).toBeDefined();
+      expect(card?.isExported).toBe(true);
+      expect(card?.decorators).toContain('Component');
+    });
+
+    it('extracts struct members: build(), lifecycle + regular methods with qualified names', () => {
+      const result = extractFromSource('pages/Index.ets', code);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      expect(methods.find((m) => m.qualifiedName === 'Index::build')).toBeDefined();
+      expect(methods.find((m) => m.qualifiedName === 'Index::aboutToAppear')).toBeDefined();
+      expect(methods.find((m) => m.qualifiedName === 'Index::load')).toBeDefined();
+    });
+
+    it('extracts @State/@Prop/@StorageLink members as properties with their decorators', () => {
+      const result = extractFromSource('pages/Index.ets', code);
+      const message = result.nodes.find((n) => n.kind === 'property' && n.qualifiedName === 'Index::message');
+      expect(message).toBeDefined();
+      expect(message?.decorators).toContain('State');
+      const count = result.nodes.find((n) => n.kind === 'property' && n.qualifiedName === 'Index::count');
+      expect(count?.decorators).toContain('Prop');
+      // Decorator-with-args: the decorator NAME is captured, not its argument.
+      const theme = result.nodes.find((n) => n.kind === 'property' && n.qualifiedName === 'Index::theme');
+      expect(theme?.decorators).toContain('StorageLink');
+    });
+
+    it('emits intra-struct method call refs (this.load())', () => {
+      const result = extractFromSource('pages/Index.ets', code);
+      const call = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'load'
+      );
+      expect(call).toBeDefined();
+    });
+  });
+
+  describe('build() DSL call surface', () => {
+    const code = `
+@Extend(Text) function titleStyle(size: number) {
+  .fontSize(size)
+}
+
+@Component
+struct Page {
+  count: number = 0;
+
+  handleTap(): void {
+    this.count += 1;
+  }
+
+  @Builder
+  headerBar(title: string) {
+    Row() {
+      Text(title).titleStyle(24)
+      Button('Go').onClick(this.handleTap)
+    }
+  }
+
+  build() {
+    Column({ space: 8 }) {
+      this.headerBar('Home')
+      ChildCard({ label: 'hi' })
+    }
+    .height('100%')
+  }
+}
+`;
+
+    function callRefsFrom(result: ReturnType<typeof extractFromSource>, methodName: string): string[] {
+      const from = result.nodes.find((n) => n.kind === 'method' && n.name === methodName);
+      return result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls' && r.fromNodeId === from?.id)
+        .map((r) => r.referenceName);
+    }
+
+    it('emits a call ref for a custom component instantiation inside build()', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      expect(callRefsFrom(result, 'build')).toContain('ChildCard');
+    });
+
+    it('emits dot-prefixed call refs for chained attributes (@Extend/@Styles-only resolution)', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      // `.titleStyle(24)` chains on the Text component — one node, repeated
+      // property/arguments field pairs, NOT nested call_expressions. The
+      // leading dot routes the ref to the decorator-gated matcher strategy so
+      // framework attributes (`.height` below) can never hit an arbitrary
+      // same-named symbol.
+      expect(callRefsFrom(result, 'headerBar')).toContain('.titleStyle');
+      expect(callRefsFrom(result, 'build')).toContain('.height');
+      expect(callRefsFrom(result, 'build')).not.toContain('height');
+    });
+
+    it('recovers the detached-chain shape (chain on the line after a nested component)', () => {
+      // Inside arkui_children, a chain starting after the closing `}` is
+      // detached by the grammar into sibling leading_dot_expression +
+      // parenthesized_expression statements — the close-button idiom.
+      const detached = `
+@Component
+struct Panel {
+  close(): void {}
+
+  build() {
+    Column() {
+      Row() {
+        Text('x')
+      }
+      .width(10)
+      .onClick(this.close)
+      .id('close_button')
+    }
+  }
+}
+`;
+      const result = extractFromSource('components/Panel.ets', detached);
+      const refs = callRefsFrom(result, 'build');
+      expect(refs).toContain('close');
+      expect(refs).toContain('.width');
+      expect(refs).not.toContain('width');
+    });
+
+    it('dot-prefixes the innermost call of a proper-form detached chain', () => {
+      // `.alignItems(x).layoutWeight(1)` under a leading_dot_expression: the
+      // wrapper consumes the dot, so the innermost call has a bare identifier
+      // function and would otherwise emit as a plain `alignItems(...)` call.
+      const chained = `
+@Component
+struct Card {
+  build() {
+    Column() {
+      List() {
+        Text('x')
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+      .height('100%')
+    }
+  }
+}
+`;
+      const result = extractFromSource('components/Card.ets', chained);
+      const refs = callRefsFrom(result, 'build');
+      expect(refs).toContain('.alignItems');
+      expect(refs).not.toContain('alignItems');
+      expect(refs).toContain('.layoutWeight');
+      expect(refs).not.toContain('layoutWeight');
+    });
+
+    it('emits a call ref for an .onClick(this.handler) method-reference binding', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      expect(callRefsFrom(result, 'headerBar')).toContain('handleTap');
+    });
+
+    it('emits a call ref for a @Builder method invoked as this.headerBar()', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      expect(callRefsFrom(result, 'build')).toContain('headerBar');
+    });
+
+    it('extracts a global @Extend function with its decorator', () => {
+      const result = extractFromSource('pages/Page.ets', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'titleStyle');
+      expect(fn).toBeDefined();
+      expect(fn?.decorators).toContain('Extend');
+    });
+  });
+
+  describe('Global @Builder functions', () => {
+    it('extracts a decorated global @Builder function with signature and decorator', () => {
+      const result = extractFromSource(
+        'common/builders.ets',
+        `@Builder\nfunction EmptyHint(message: string) {\n  Column() {\n    Text(message).fontSize(16)\n  }\n}\n`
+      );
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'EmptyHint');
+      expect(fn).toBeDefined();
+      expect(fn?.signature).toBe('(message: string)');
+      expect(fn?.decorators).toContain('Builder');
+    });
+  });
+
+  describe('Standard TypeScript constructs in .ets', () => {
+    it('extracts classes, interfaces, enums, type aliases and their members', () => {
+      const code = `
+export enum Priority { Low, Medium = 2, High }
+
+export interface Shape {
+  area(): number;
+}
+
+export type Handler = (e: string) => void;
+
+export class Service {
+  private count: number = 0;
+  doWork(x: number): number {
+    return this.helper(x);
+  }
+  helper(n: number): number { return n * 2; }
+}
+`;
+      const result = extractFromSource('common/service.ets', code);
+      expect(result.nodes.find((n) => n.kind === 'class' && n.name === 'Service')).toBeDefined();
+      expect(result.nodes.find((n) => n.kind === 'enum' && n.name === 'Priority')).toBeDefined();
+      const members = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.qualifiedName);
+      expect(members).toEqual(expect.arrayContaining(['Priority::Low', 'Priority::Medium', 'Priority::High']));
+      expect(result.nodes.find((n) => n.kind === 'interface' && n.name === 'Shape')).toBeDefined();
+      expect(result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'Handler')).toBeDefined();
+      const doWork = result.nodes.find((n) => n.qualifiedName === 'Service::doWork');
+      expect(doWork?.kind).toBe('method');
+      expect(doWork?.signature).toBe('(x: number): number');
+      expect(
+        result.unresolvedReferences.find((r) => r.referenceKind === 'calls' && r.referenceName === 'helper')
+      ).toBeDefined();
+    });
+  });
+
+  describe('Import extraction', () => {
+    it('extracts relative, SDK (@ohos/@kit) and default imports', () => {
+      const code = `
+import router from '@ohos.router';
+import { promptAction } from '@kit.ArkUI';
+import { TodoItem } from '../model/TodoItem';
+import DataStore from '../data/DataStore';
+`;
+      const result = extractFromSource('pages/imports.ets', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('@ohos.router');
+      expect(imports).toContain('@kit.ArkUI');
+      expect(imports).toContain('../model/TodoItem');
+      expect(imports).toContain('../data/DataStore');
     });
   });
 });
