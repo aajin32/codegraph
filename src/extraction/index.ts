@@ -23,7 +23,8 @@ import {
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
 import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './parse-pool';
-import { StoreWriter, StoreBundle } from './store-writer';
+import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
+import { materializeKernelResult } from './kernel';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
@@ -1614,8 +1615,15 @@ export class ExtractionOrchestrator {
     let pool: ParseWorkerPool | null = null;
     if (useWorker) {
       // CODEGRAPH_PARSE_WORKERS: explicit worker count; 1 = the old single-worker
-      // behaviour (the conservative rollback). Unset → clamp(cores-1, 1, 8).
-      const poolSize = resolveParsePoolSize(process.env.CODEGRAPH_PARSE_WORKERS, os.cpus().length);
+      // behaviour (the conservative rollback). Unset → clamp(cores-1, 1, 8),
+      // with cores from availableParallelism — cpuset/affinity-honest, where
+      // os.cpus() enumerates the host's CPUs and spawned 8 wasm workers (and
+      // their grammar heaps) inside a 2-CPU container for zero extra
+      // throughput (§7a.1). Floored so a 2-core box still gets 2 workers:
+      // parse is worker-side CPU, and 1 worker measured 34% slower than the
+      // old oversubscribed pool on the kernel-scale 2-cpuset envelope
+      // (493s vs 369s) — main + store-worker don't fill the second core.
+      const poolSize = resolveParsePoolSize(process.env.CODEGRAPH_PARSE_WORKERS, Math.max(3, os.availableParallelism()));
       // Read each needed grammar's WASM ONCE here and hand the bytes to every
       // worker, so spawns/respawns load grammars from memory instead of
       // re-reading them from disk (#1231: on an HDD, respawn re-reads amplify
@@ -1706,16 +1714,34 @@ export class ExtractionOrchestrator {
       const bp = walBackpressure?.();
       if (bp) await bp;
 
+      // Kernel deferred-decode results carry table sizes in kernelCounts
+      // (their object arrays are empty — decode happens at the store).
+      const nodeCount = result.kernelCounts?.nodes ?? result.nodes.length;
+      const edgeCount = result.kernelCounts?.edges ?? result.edges.length;
+
       // Store: on the writer thread when active (fresh DB — bundles applied
       // in the same file order this chain dispatches them), else on the main
       // thread (SQLite connections are per-thread).
-      if (result.nodes.length > 0 || result.errors.length === 0) {
+      if (nodeCount > 0 || result.errors.length === 0) {
         const language = detectLanguage(filePath, content, overrides);
         if (storeWriter) {
-          storeWriter.send(this.buildFreshStoreBundle(filePath, content, language, stats, result));
+          if (result.kernelBuffers) {
+            // Buffers go to the writer as-is; the worker decodes + finalizes.
+            // The main thread's only per-file work stays O(1) + the content hash.
+            storeWriter.send({
+              kernel: true,
+              filePath,
+              language,
+              buffers: result.kernelBuffers,
+              file: this.buildFileRecord(filePath, content, language, stats, nodeCount, result.errors),
+            });
+          } else {
+            storeWriter.send(this.buildFreshStoreBundle(filePath, content, language, stats, result));
+          }
           await storeWriter.waitBelow(STORE_WRITER_WINDOW);
         } else {
-          await this.storeExtractionResult(filePath, content, language, stats, result, commitYield);
+          const materialized = materializeKernelResult(result, filePath, language);
+          await this.storeExtractionResult(filePath, content, language, stats, materialized, commitYield);
         }
       }
 
@@ -1726,10 +1752,10 @@ export class ExtractionOrchestrator {
         errors.push(...result.errors);
       }
 
-      if (result.nodes.length > 0) {
+      if (nodeCount > 0) {
         filesIndexed++;
-        totalNodes += result.nodes.length;
-        totalEdges += result.edges.length;
+        totalNodes += nodeCount;
+        totalEdges += edgeCount;
       } else if (result.errors.some((e) => e.severity === 'error')) {
         filesErrored++;
       } else {
@@ -2383,6 +2409,27 @@ export class ExtractionOrchestrator {
    * check, no cross-file edge snapshot (both are re-index concerns — a fresh
    * database has neither). Filters mirror storeExtractionResult exactly.
    */
+  /** The FileRecord for a fresh-index store (nodeCount is the PRE-filter count). */
+  private buildFileRecord(
+    filePath: string,
+    content: string,
+    language: Language,
+    stats: fs.Stats,
+    nodeCount: number,
+    resultErrors: ExtractionResult['errors']
+  ): FileRecord {
+    return {
+      path: filePath,
+      contentHash: hashContent(content),
+      language,
+      size: stats.size,
+      modifiedAt: stats.mtimeMs,
+      indexedAt: Date.now(),
+      nodeCount,
+      errors: resultErrors.length > 0 ? resultErrors : undefined,
+    };
+  }
+
   private buildFreshStoreBundle(
     filePath: string,
     content: string,
@@ -2390,33 +2437,12 @@ export class ExtractionOrchestrator {
     stats: fs.Stats,
     result: ExtractionResult
   ): StoreBundle {
-    const validNodes = result.nodes.filter((n) => n.id && n.kind && n.name && n.filePath && n.language);
-    const insertedIds = new Set(validNodes.map((n) => n.id));
-    const validEdges = result.edges.filter(
-      (e) => insertedIds.has(e.source) && insertedIds.has(e.target)
+    return finalizeStoreBundle(
+      result,
+      filePath,
+      language,
+      this.buildFileRecord(filePath, content, language, stats, result.nodes.length, result.errors)
     );
-    const validRefs = result.unresolvedReferences
-      .filter((ref) => insertedIds.has(ref.fromNodeId))
-      .map((ref) => ({
-        ...ref,
-        filePath: ref.filePath ?? filePath,
-        language: ref.language ?? language,
-      }));
-    return {
-      nodes: validNodes,
-      edges: validEdges,
-      refs: validRefs,
-      file: {
-        path: filePath,
-        contentHash: hashContent(content),
-        language,
-        size: stats.size,
-        modifiedAt: stats.mtimeMs,
-        indexedAt: Date.now(),
-        nodeCount: result.nodes.length,
-        errors: result.errors.length > 0 ? result.errors : undefined,
-      },
-    };
   }
 
   /**
