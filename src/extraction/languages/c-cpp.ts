@@ -166,6 +166,35 @@ export function stripCppTemplateArgs(name: string): string {
   return out.trim();
 }
 
+
+/**
+ * Is this C++ `field_declaration` a pure-virtual method (`virtual int read(int key) = 0;`)?
+ * tree-sitter-cpp shapes those as a field_declaration whose declarator unwraps to a
+ * `function_declarator`, with the pure-virtual `= 0` as a DIRECT `number_literal` "0"
+ * child of the field_declaration (default-arg `= 0` lives inside parameter_declaration
+ * and must not match). Bodiless method prototypes (`int foo();`) and data members
+ * (`int x = 0;`) are excluded — prototypes usually have an out-of-line definition that
+ * already mints the method node; pure virtuals never do (#1727).
+ */
+export function isCppPureVirtualMethodDecl(node: SyntaxNode): boolean {
+  if (node.type !== 'field_declaration') return false;
+  let declarator: SyntaxNode | null = getChildByField(node, 'declarator');
+  if (!declarator) return false;
+  while (
+    declarator.type === 'pointer_declarator' ||
+    declarator.type === 'reference_declarator'
+  ) {
+    const inner: SyntaxNode | null =
+      getChildByField(declarator, 'declarator') || declarator.namedChild(0);
+    if (!inner) return false;
+    declarator = inner;
+  }
+  if (declarator.type !== 'function_declarator') return false;
+  return node.namedChildren.some(
+    (c: SyntaxNode) => c.type === 'number_literal' && c.text === '0'
+  );
+}
+
 /**
  * A function/method's return type lives in the `function_definition`'s `type`
  * field (`Metrics& Metrics::instance()` → `Metrics`). Constructors, destructors,
@@ -452,6 +481,54 @@ export function blankMetalAttributes(source: string): string {
 }
 
 /**
+ * Hide C++ raw literals from the offset-preserving preParse scans (#1505).
+ * Neither macro-shaped text in a raw body nor its `)delim"` closer is code.
+ * Mask the whole literal with non-whitespace, non-paren tokens, keeping line
+ * endings, so even line-based scanners treat a multiline raw argument as opaque.
+ * Restore untouched bytes afterward; a real enclosing annotation can still be
+ * removed in full. The pipeline masks once, and individual paren blankers also
+ * use this helper so they are safe when called directly.
+ */
+function maskCppRawStrings(source: string): { source: string; restore: (blanked: string) => string } {
+  const unchanged = { source, restore: (blanked: string): string => blanked };
+  if (source.indexOf('R"') === -1) return unchanged;
+  // Skip comments and ordinary literals before looking for a raw opener. The
+  // char-literal boundary leaves numeric digit separators (1'000) alone.
+  const re = /\/\/[^\r\n]*|\/\*[\s\S]*?(?:\*\/|$)|\b(?:u8|[LuU])?R"([^ \t\v\f\r\n()\\]{0,16})\(|"(?:\\[\s\S]|[^"\\])*(?:"|$)|(?<!\w)(?:u8|[LuU])?'(?:\\[\s\S]|[^'\\])*(?:'|$)/g;
+  const spans: Array<{ start: number; end: number }> = [];
+  const parts: string[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) {
+    if (m[1] === undefined) continue;
+    const closer = `)${m[1]}"`;
+    const close = source.indexOf(closer, re.lastIndex);
+    // An unterminated raw literal owns the rest of the file too.
+    const end = close < 0 ? source.length : close + closer.length;
+    spans.push({ start: m.index, end });
+    parts.push(source.slice(last, m.index), source.slice(m.index, end).replace(/[^\r\n]/g, '\0'));
+    last = re.lastIndex = end;
+  }
+  if (spans.length === 0) return unchanged;
+  parts.push(source.slice(last));
+  const masked = parts.join('');
+  return {
+    source: masked,
+    restore(blanked): string {
+      // A length-changing rewrite cannot be restored at the original offsets.
+      if (blanked === masked || blanked.length !== source.length) return source;
+      const chars = blanked.split('');
+      for (const { start, end } of spans) {
+        for (let i = start; i < end; i++) {
+          if (chars[i] === '\0') chars[i] = source[i] as string;
+        }
+      }
+      return chars.join('');
+    },
+  };
+}
+
+/**
  * Blank annotation-style macro invocations that decorate a declaration but carry
  * NO terminating semicolon — the pervasive Unreal-Engine reflection markup
  * (`UPROPERTY(...)`, `UFUNCTION(...)`, `UCLASS(...)`, `GENERATED_BODY()`,
@@ -490,6 +567,8 @@ export function blankMetalAttributes(source: string): string {
  */
 export function blankCppAnnotationMacroCalls(source: string): string {
   if (!/^[ \t]*[A-Z][A-Z0-9_]{2,}\s*\(/m.test(source)) return source;
+  const rawStrings = maskCppRawStrings(source);
+  source = rawStrings.source;
   const chars = source.split('');
   const re = /^([ \t]*)([A-Z][A-Z0-9_]{2,})(\s*)\(/gm;
   let m: RegExpExecArray | null;
@@ -527,7 +606,7 @@ export function blankCppAnnotationMacroCalls(source: string): string {
     }
     re.lastIndex = end;
   }
-  return chars.join('');
+  return rawStrings.restore(chars.join(''));
 }
 
 /**
@@ -641,6 +720,8 @@ export function blankCppApiPrefixMacros(source: string): string {
 const CPP_INLINE_ANNOTATION_RE = /\b(?:UMETA|UPARAM|UE_DEPRECATED\w*)\s*\(/g;
 export function blankCppInlineAnnotationMacros(source: string): string {
   if (!/\b(?:UMETA|UPARAM|UE_DEPRECATED)/.test(source)) return source;
+  const rawStrings = maskCppRawStrings(source);
+  source = rawStrings.source;
   const chars = source.split('');
   const re = new RegExp(CPP_INLINE_ANNOTATION_RE.source, 'g');
   let m: RegExpExecArray | null;
@@ -671,7 +752,7 @@ export function blankCppInlineAnnotationMacros(source: string): string {
     }
     re.lastIndex = end;
   }
-  return chars.join('');
+  return rawStrings.restore(chars.join(''));
 }
 
 /**
@@ -795,6 +876,8 @@ function restoreDirectiveLines(original: string, blanked: string): string {
  * or by content, for CUDA living in `.h`/`.hpp` headers). Offset-preserving;
  * directive lines are restored at the end (see restoreDirectiveLines). */
 function preParseCppSource(source: string, filePath?: string): string {
+  const rawStrings = maskCppRawStrings(source);
+  source = rawStrings.source;
   // blankCLeadingAttrMacros runs AFTER the api-prefix blank so a stacked
   // `FMT_NORETURN FMT_API void f(…)` reduces to the `MACRO Ret name(` shape
   // it matches (the _API token is already spaces by then).
@@ -813,7 +896,7 @@ function preParseCppSource(source: string, filePath?: string): string {
   } else if (lower.endsWith('.cu') || lower.endsWith('.cuh') || looksLikeCudaSource(source)) {
     blanked = blankCudaConstructs(blanked);
   }
-  return restoreDirectiveLines(source, blanked);
+  return rawStrings.restore(restoreDirectiveLines(source, blanked));
 }
 
 /**
@@ -941,6 +1024,8 @@ const C_STMT_MACRO_KEYWORDS = new Set([
   'if', 'while', 'for', 'switch', 'return', 'do', 'else', 'sizeof',
 ]);
 export function blankCStatementMacroCalls(source: string): string {
+  const rawStrings = maskCppRawStrings(source);
+  source = rawStrings.source;
   const lines = source.split('\n');
   let changed = false;
   const content = (l: string): string => l.replace(/\r$/, '').trim();
@@ -1044,7 +1129,7 @@ export function blankCStatementMacroCalls(source: string): string {
     }
     changed = true;
   }
-  return changed ? lines.join('\n') : source;
+  return rawStrings.restore(changed ? lines.join('\n') : source);
 }
 
 /**
@@ -1215,8 +1300,8 @@ const C_PARAM_ANNOTATION_RE = new RegExp(
 );
 export function blankCParameterizedAnnotationMacros(source: string): string {
   if (source.indexOf('__') === -1) return source;
-  C_PARAM_ANNOTATION_RE.lastIndex = 0;
-  if (!C_PARAM_ANNOTATION_RE.test(source)) return source;
+  const rawStrings = maskCppRawStrings(source);
+  source = rawStrings.source;
   C_PARAM_ANNOTATION_RE.lastIndex = 0;
   let result = '';
   let last = 0;
@@ -1236,7 +1321,7 @@ export function blankCParameterizedAnnotationMacros(source: string): string {
     result += source.slice(last, start) + source.slice(start, end).replace(/[^\n\r]/g, ' ');
     last = end;
   }
-  return result + source.slice(last);
+  return rawStrings.restore(result + source.slice(last));
 }
 
 /**
@@ -1279,6 +1364,8 @@ const C_TYPE_ARG_OPENER_RE = /^(struct|union|enum)([ \t\r\n]+)([A-Za-z_]\w*)([ \
 const C_TYPE_ARG_SCAN_CAP = 600;
 export function blankCTypeKeywordArgs(source: string): string {
   if (!/\b(?:struct|union|enum)[ \t\r\n]/.test(source)) return source;
+  const rawStrings = maskCppRawStrings(source);
+  source = rawStrings.source;
   let chars: string[] | null = null;
   C_TYPE_ARG_HEAD_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
@@ -1346,7 +1433,7 @@ export function blankCTypeKeywordArgs(source: string): string {
       atArgStart = false;
     }
   }
-  return chars ? chars.join('') : source;
+  return rawStrings.restore(chars ? chars.join('') : source);
 }
 
 /**
@@ -1374,6 +1461,8 @@ export function blankCTypeKeywordArgs(source: string): string {
 const C_PREFIXED_DECL_MACRO_RE = /^[ \t]*(?:static|extern)[ \t]+[A-Z][A-Z0-9_]{2,}[ \t]*\(/;
 export function blankCFileScopePrefixedDeclMacros(source: string): string {
   if (!/^[ \t]*(?:static|extern)[ \t]+[A-Z]/m.test(source)) return source;
+  const rawStrings = maskCppRawStrings(source);
+  source = rawStrings.source;
   const lines = source.split('\n');
   let changed = false;
   for (let i = 0; i < lines.length; i++) {
@@ -1408,7 +1497,7 @@ export function blankCFileScopePrefixedDeclMacros(source: string): string {
     lines[i] = line.replace(/[^\n\r]/g, ' ');
     changed = true;
   }
-  return changed ? lines.join('\n') : source;
+  return rawStrings.restore(changed ? lines.join('\n') : source);
 }
 
 /**
@@ -1539,6 +1628,8 @@ export function blankCNamedVariadicDefineDots(source: string): string {
  */
 export function blankCDesignatedMacroArgs(source: string): string {
   if (source.indexOf('=') === -1) return source;
+  const rawStrings = maskCppRawStrings(source);
+  source = rawStrings.source;
   const out = source.split('');
   const re = /^[ \t]*([A-Z_][A-Z0-9_]*)\s*\(/gm;
   let m: RegExpExecArray | null;
@@ -1560,10 +1651,12 @@ export function blankCDesignatedMacroArgs(source: string): string {
     for (let k = open + 1; k < close; k++) if (out[k] !== '\n') out[k] = ' ';
     re.lastIndex = close;
   }
-  return out.join('');
+  return rawStrings.restore(out.join(''));
 }
 
 function preParseCSource(source: string): string {
+  const rawStrings = maskCppRawStrings(source);
+  source = rawStrings.source;
   const inner = blankCDesignatedMacroArgs(blankCKernelAnnotations(blankCCplusplusGuardBodies(source)));
   let blanked = blankCLeadingAttrMacros(
     blankLoneMacroLines(
@@ -1589,7 +1682,7 @@ function preParseCSource(source: string): string {
   if (looksLikeCudaSource(blanked)) blanked = blankCudaConstructs(blanked);
   // The named-variadic `#define` pass runs AFTER the directive restore — it
   // deliberately edits directive lines (see its doc comment).
-  return blankCNamedVariadicDefineDots(restoreDirectiveLines(source, blanked));
+  return rawStrings.restore(blankCNamedVariadicDefineDots(restoreDirectiveLines(source, blanked)));
 }
 
 export const cppExtractor: LanguageExtractor = {
@@ -1607,7 +1700,17 @@ export const cppExtractor: LanguageExtractor = {
   // get picked as the blast-radius representative over — the single real
   // definition, exactly as bodiless struct/enum specifiers are already skipped. (#1093)
   skipBodilessClass: true,
-  methodTypes: ['function_definition'],
+  // `function_definition` covers inline / out-of-line bodies; `field_declaration`
+  // covers pure-virtual methods (`virtual int read(int key) = 0;`), which have no
+  // body and would otherwise mint no node — so calls through the abstract base and
+  // cpp-override synthesis had nothing to attach to (#1727). classifyMethodNode
+  // keeps ordinary data members / prototypes on the children-walk path.
+  methodTypes: ['function_definition', 'field_declaration'],
+  classifyMethodNode: (node) => {
+    if (node.type !== 'field_declaration') return 'method';
+    return isCppPureVirtualMethodDecl(node) ? 'method' : 'skip';
+  },
+  isAbstract: (node) => (isCppPureVirtualMethodDecl(node) ? true : undefined),
   interfaceTypes: [],
   structTypes: ['struct_specifier'],
   // C++ unions additionally carry member functions, which extract through the
