@@ -23,7 +23,8 @@ import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs, isCppConstructorDeclaration } from './languages/c-cpp';
 import { rustImplTypeName } from './languages/rust';
-import { isDartTypeName, pushDartTypeRefs } from './languages/dart';
+import { goEmbeddedTypeName } from './languages/go';
+import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeRefs } from './languages/dart';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -381,8 +382,8 @@ const MEMBER_ACCESS_TYPES: ReadonlySet<string> = new Set([
  * static read is pure duplication) — while adding real graph noise (+1813 edges /
  * +2448 `references` on excalidraw, the retrieval-perf benchmark, all pointing at
  * already-covered types). Don't re-add `member_expression`/`attribute` here.
- * VB.NET (#2305) sends the member with its receiver instead, and its resolver
- * decides whether the receiver is a type (see extractVbMemberRead).
+ * VB.NET (#2305) sends every member read with its receiver instead, and its
+ * resolver decides whether the receiver is a type (see extractVbMemberRead).
  * Rust imports too, but a variant is usually written through a path that names
  * its module, not its enum (`mode::Mode::A` under `use crate::mode;`), so no
  * `use` names the enum at all (#2328).
@@ -403,7 +404,8 @@ const RUST_NON_MEMBER_PATH_PARENTS: ReadonlySet<string> = new Set([
 /**
  * VB.NET receivers no project type can be named: the namespace roots
  * (`System.IO.Path`, `My.Settings`, `Global.X`) and the built-in type keywords
- * (`String.Empty`, `Integer.MaxValue`). A read through one is never sent.
+ * (`String.Empty`, `Integer.MaxValue`). A read through one, or a path that
+ * starts with one, is never sent.
  */
 const VB_NON_TYPE_RECEIVERS =
   /^(?:Global|System|Microsoft|My|Boolean|Byte|Char|Date|Decimal|Double|Integer|Long|Object|SByte|Short|Single|String|UInteger|ULong|UShort)$/i;
@@ -561,7 +563,12 @@ export class TreeSitterExtractor {
    * same symbol, and the column holds free text (#1905).
    */
   private docstringFor(node: SyntaxNode): string | undefined {
-    const preceding = getPrecedingDocstring(node, this.source);
+    const anchor = this.extractor?.getDeclarationWrapper?.(node) ?? node;
+    const preceding = getPrecedingDocstring(
+      anchor,
+      this.source,
+      this.extractor?.docstringStepOverTypes
+    );
     const body = this.extractor?.getBodyDocstring?.(node, this.source);
     if (preceding && body) return `${preceding}\n\n${body}`;
     return body || preceding;
@@ -2816,8 +2823,12 @@ export class TreeSitterExtractor {
     // not the character. Escaped as the kernel's `regex::escape` does, so
     // both paths decide the same.
     const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Inside `{ … }` the name is bounded by a character that can't continue
+    // an identifier, not by `\b`, which takes a `$` for a separator: it can't
+    // bound `items$` and finds `items` inside it. Spelled in ASCII, as the
+    // kernel spells it, since the kernel's `\w` is Unicode.
     const re = new RegExp(
-      `^[ \\t]*export\\s+(?:default\\s+${n}\\s*;?[ \\t]*$|\\{[^}]*\\b${n}\\b[^}]*\\})`,
+      `^[ \\t]*export\\s+(?:default\\s+${n}\\s*;?[ \\t]*$|\\{(?:[^}]*[^0-9A-Za-z_$}])?${n}(?:[^0-9A-Za-z_$}][^}]*)?\\})`,
       'm'
     );
     return re.test(this.source);
@@ -3785,7 +3796,7 @@ export class TreeSitterExtractor {
    * contained by the interface (e.g. `Marshal`, `Unmarshal` of a `Core`
    * interface). tree-sitter-go names these `method_elem` (newer) or
    * `method_spec` (older). Embedded interfaces (`Reader` inside `ReadWriter`)
-   * are `type_identifier`s, not methods, and are left to inheritance extraction.
+   * are `type_elem`s, not methods, and are left to inheritance extraction.
    */
   private extractGoInterfaceMethods(interfaceType: SyntaxNode, ifaceId: string): void {
     this.nodeStack.push(ifaceId);
@@ -4531,6 +4542,15 @@ export class TreeSitterExtractor {
         }
       } else if (fn.type === 'identifier') {
         calleeName = getNodeText(fn, this.source);
+      } else if (fn.type === 'with_member_access_expression') {
+        // `.Run()` in a `With x` block is `x.Run()`; through a longer path
+        // (`Me._h`, `{T}` for `With DirectCast(o, T)`) the resolver types each link.
+        const member = fn.namedChild(0);
+        const target = this.vbWithTarget(fn);
+        const receiver = target ? this.vbReceiverPath(target) : null;
+        if (member?.type !== 'identifier' || !receiver || VB_NON_TYPE_RECEIVERS.test(receiver.split('.')[0]!)) return;
+        const memberName = getNodeText(member, this.source);
+        calleeName = /^(?:me|mybase|myclass)$/i.test(receiver) ? memberName : `${receiver}.${memberName}`;
       } else {
         return; // parenthesized/chained receivers: no static name to link
       }
@@ -5773,8 +5793,12 @@ export class TreeSitterExtractor {
     if (this.language === 'dart') {
       if (node.type !== 'selector') return;
       if (node.namedChildren.some((c: SyntaxNode) => c.type === 'argument_part')) return;
-      const prev = node.previousNamedSibling;
+      const prev = dartReceiverOf(node);
       if (prev?.type === 'identifier' && /^[A-Z][A-Za-z0-9_]*$/.test(prev.text)) {
+        // `Map` in `x.read<Map<K, V>>(y)` parsed as comparisons is a type
+        // argument, which the body walker references as a type.
+        const before = knownParent?.type === 'relational_expression' ? prev.previousNamedSibling : null;
+        if (before?.type === 'relational_operator' && dartMisparsedGenericCall(before)) return;
         this.pushStaticMemberRef(prev.text, ownerId, prev);
       }
       return;
@@ -5809,6 +5833,11 @@ export class TreeSitterExtractor {
       return;
     }
 
+    if (this.language === 'vbnet') {
+      this.extractVbMemberRead(node, knownParent, ownerId);
+      return;
+    }
+
     if (!MEMBER_ACCESS_TYPES.has(node.type)) return;
 
     // Skip `Type.method()` — the access is the callee of a call, already linked.
@@ -5830,10 +5859,6 @@ export class TreeSitterExtractor {
       getChildByField(node, 'scope') ??
       node.namedChild(0);
     if (!recv) return;
-    if (this.language === 'vbnet') {
-      this.extractVbMemberRead(node, recv, ownerId);
-      return;
-    }
     const t = recv.type;
     if (
       t === 'identifier' || t === 'type_identifier' || t === 'simple_identifier' ||
@@ -5855,28 +5880,128 @@ export class TreeSitterExtractor {
   }
 
   /**
-   * VB.NET: a value read or write through a name — `AppSession.SessionId`,
-   * `AppSession.CurrentUser = "demo"`, `Logger.Level`, `Mode.Fast` — is a use
-   * of the member as well as of what the name names (#2305). One `references`
-   * ref carries both, as `Name.Member` (the receiver kept, as a call's is);
-   * the resolver links the member and the type when the name means a project
-   * type or module there, and nothing when it holds a value (a local, a
-   * parameter, a field), which only it can tell in case-insensitive VB.NET
-   * (see vbnet-receivers' matchVbMemberRead). Its types are Capitalized all
-   * the same, so a lowercase receiver — a local, nearly always — is skipped.
+   * VB.NET: a value read or write through a receiver — `AppSession.SessionId`,
+   * `AppSession.CurrentUser = "demo"`, `x.Normal = 3`, `Me._h.Title`, `.Value`
+   * in a `With` block, `.Switch` in `New BoolParam With {.Switch = "--x"}` —
+   * is a use of the member, and through a type name of the type (#2305). One
+   * `references` ref carries the member with its receiver as a path:
+   * `x.Normal`, `Me._h.Title`, or `{T}.Switch` for a value whose type the code
+   * writes (a cast's, a `New`'s). The resolver decides what the receiver is —
+   * a project type, or a value of the type it is declared as — which only it
+   * can tell in case-insensitive VB.NET (see vbnet-receivers'
+   * matchVbMemberRead). A call through the access is the call extractor's.
    */
-  private extractVbMemberRead(node: SyntaxNode, recv: SyntaxNode, ownerId: string): void {
-    const member = getChildByField(node, 'member');
-    if (recv.type !== 'identifier' || member?.type !== 'identifier') return;
-    const name = getNodeText(recv, this.source);
-    if (!/^[A-Z]\w*$/.test(name) || VB_NON_TYPE_RECEIVERS.test(name)) return;
+  private extractVbMemberRead(node: SyntaxNode, knownParent: SyntaxNode | undefined, ownerId: string): void {
+    let receiver: string | null;
+    let member: SyntaxNode | null;
+    if (node.type === 'member_access_expression') {
+      member = getChildByField(node, 'member');
+      const object = getChildByField(node, 'object');
+      receiver = object && !this.isVbSplitNew(object) ? this.vbReceiverPath(object) : null;
+    } else if (node.type === 'with_member_access_expression') {
+      member = node.namedChild(0);
+      const target = this.vbWithTarget(node);
+      receiver = target ? this.vbReceiverPath(target) : null;
+    } else if (node.type === 'member_initializer') {
+      member = getChildByField(node, 'name');
+      const creation = (knownParent ?? node.parent)?.parent;
+      receiver = creation?.type === 'object_creation_expression' ? this.vbReceiverPath(creation) : null;
+    } else return;
+    if (!receiver || member?.type !== 'identifier' || VB_NON_TYPE_RECEIVERS.test(receiver.split('.')[0]!)) return;
+    // `x.Method()`: the access is the callee of a call, which the call extractor links.
+    const parent = node.type === 'member_initializer' ? null : knownParent ?? node.parent;
+    if (parent && this.extractor!.callTypes.includes(parent.type)) {
+      const callee = getChildByField(parent, 'function') ?? getChildByField(parent, 'method') ?? parent.namedChild(0);
+      if (callee && callee.startIndex === node.startIndex) return;
+    }
     this.unresolvedReferences.push({
       fromNodeId: ownerId,
-      referenceName: `${name}.${getNodeText(member, this.source)}`,
+      referenceName: `${receiver}.${getNodeText(member, this.source)}`,
       referenceKind: 'references',
       line: node.startPosition.row + 1,
       column: node.startPosition.column,
     });
+  }
+
+  /**
+   * A VB.NET receiver as the resolver reads it: a name, `Me` / `MyClass` /
+   * `MyBase`, a member of one (`Me._h`, `user.Settings`), a `With` block's
+   * `.Inner`, or `{T}` for a value whose type the code writes there
+   * (`DirectCast(o, T)`, `New T(…)`). Null for anything else — an index, a
+   * call's result, a built-in type — which no declaration here types.
+   */
+  private vbReceiverPath(node: SyntaxNode, depth = 0): string | null {
+    if (depth > 6) return null;
+    switch (node.type) {
+      case 'identifier':
+        return getNodeText(node, this.source);
+      case 'me_expression':
+        return 'Me';
+      case 'myclass_expression':
+        return 'MyClass';
+      case 'mybase_expression':
+        return 'MyBase';
+      case 'parenthesized_expression': {
+        const inner = node.namedChild(0);
+        return inner ? this.vbReceiverPath(inner, depth + 1) : null;
+      }
+      case 'member_access_expression':
+      case 'with_member_access_expression': {
+        const through = node.type === 'member_access_expression';
+        const member = through ? getChildByField(node, 'member') : node.namedChild(0);
+        if (member?.type !== 'identifier') return null;
+        const object = through ? getChildByField(node, 'object') : this.vbWithTarget(node);
+        if (through && object && this.isVbSplitNew(object)) return null;
+        const head = object ? this.vbReceiverPath(object, depth + 1) : null;
+        return head ? `${head}.${getNodeText(member, this.source)}` : null;
+      }
+      case 'cast_expression':
+      case 'object_creation_expression': {
+        let type = getChildByField(node, 'type');
+        // `New T()` parses as an array type whose rank is the constructor's empty parentheses.
+        if (node.type === 'object_creation_expression' && type?.type === 'array_type') {
+          const rank = type.namedChildren.find((c: SyntaxNode) => c.type === 'array_rank_specifier');
+          type = rank && /^\(\s*\)$/.test(getNodeText(rank, this.source)) ? getChildByField(type, 'element_type') : null;
+        }
+        if (!type || type.type === 'predefined_type' || type.type === 'array_type') return null;
+        const written = getNodeText(type, this.source).replace(/\s+/g, ' ');
+        // .NET's own types (`System.Drawing.Point`) are never the project's.
+        return /^(?:System|Microsoft|My)\./i.test(written) ? null : `{${written}}`;
+      }
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Whether `node`, a member access's object, is `New System` of `New
+   * System.Drawing.Size(…)` or `New Ns` of `New Ns.Holder`: the grammar reads
+   * a qualified type after `New` as members read through a `New` of its first
+   * name. A value's `New` has its parentheses (`New Holder().Normal`).
+   */
+  private isVbSplitNew(node: SyntaxNode): boolean {
+    return node.type === 'object_creation_expression' && !getChildByField(node, 'arguments') &&
+      !getChildByField(node, 'initializer') && getChildByField(node, 'type')?.type !== 'array_type';
+  }
+
+  /**
+   * What a VB.NET `.Member` is read through: the expression of the `With`
+   * block it is in (a nested block's own `With .Inner` is read through the
+   * block around it), or the object an initializer sets up (`New T With {.X =
+   * 1}`). Null in an anonymous type's `New With {.X = 1}`, which declares X.
+   */
+  private vbWithTarget(node: SyntaxNode): SyntaxNode | null {
+    let child = node;
+    for (let p = node.parent; p; child = p, p = p.parent) {
+      if (p.type === 'with_statement') {
+        const expression = getChildByField(p, 'expression');
+        if (expression && expression.startIndex === child.startIndex && expression.endIndex === child.endIndex) continue;
+        return expression;
+      }
+      if (p.type === 'object_initializer') return p.parent?.type === 'object_creation_expression' ? p.parent : null;
+      if (p.type === 'anonymous_object_creation_expression') return null;
+    }
+    return null;
   }
 
   /**
@@ -6086,9 +6211,16 @@ export class TreeSitterExtractor {
     //    wrapper objects from `parent`/`namedChild` navigation, so
     //    `sibling === declNode` is unreliable — `startIndex` does
     //    the matching instead.
-    const parent = declNode.parent;
+    //
+    //    A grammar that wraps the declaration (Dart's `declaration`
+    //    around a member with no body) puts the annotations before the
+    //    wrapper, so the scan starts there. One that lets comments sit
+    //    between the annotations and the declaration (Dart) steps over them.
+    const anchor = this.extractor?.getDeclarationWrapper?.(declNode) ?? declNode;
+    const stepOver = this.extractor?.decoratorStepOverTypes;
+    const parent = anchor.parent;
     if (parent) {
-      const declStart = declNode.startIndex;
+      const declStart = anchor.startIndex;
       let declIdx = -1;
       for (let i = 0; i < parent.namedChildCount; i++) {
         const sibling = parent.namedChild(i);
@@ -6101,6 +6233,7 @@ export class TreeSitterExtractor {
         for (let j = declIdx - 1; j >= 0; j--) {
           const sibling = parent.namedChild(j);
           if (!sibling) continue;
+          if (stepOver?.includes(sibling.type)) continue;
           if (sibling.type !== 'decorator' && sibling.type !== 'annotation' && sibling.type !== 'marker_annotation') {
             break; // non-decorator separator → stop consuming
           }
@@ -6489,7 +6622,7 @@ export class TreeSitterExtractor {
       // A member read that may run code — Dart's `x.area` calls the getter
       // `area` (#2338). The resolver links it to a getter, as a call, or to
       // nothing: a plain field read stays a reference that names no symbol.
-      const read = this.extractor!.extractMemberRead?.(node);
+      const read = this.extractor!.extractMemberRead?.(node, parent);
       if (read) {
         const readerId = this.nodeStack[this.nodeStack.length - 1];
         if (readerId) {
@@ -6504,18 +6637,22 @@ export class TreeSitterExtractor {
       }
 
       // A type a Dart body names — a local's declared type, a generic argument
-      // (`Future<Report?>.value(null)`, `context.read<Report>()`), a cast, a
-      // type test — is the function's dependency, as a TS local's annotation
-      // is just below (#2327).
-      if (this.language === 'dart' && nodeType === 'type_identifier' && isDartTypeName(node)) {
+      // (`Future<Report?>.value(null)`, `context.read<Report>()`, and
+      // `ref.read<Report>(p)` when the grammar read that call as comparisons),
+      // a cast, a type test — is the function's dependency, as a TS local's
+      // annotation is just below (#2327).
+      if (this.language === 'dart') {
+        const typeNode = nodeType === 'type_identifier' ? node
+          : nodeType === 'relational_operator' ? dartMisparsedGenericCall(node)?.typeName
+          : undefined;
         const ownerId = this.nodeStack[this.nodeStack.length - 1];
-        if (ownerId) {
+        if (typeNode && ownerId && isDartTypeName(typeNode)) {
           this.unresolvedReferences.push({
             fromNodeId: ownerId,
-            referenceName: getNodeText(node, this.source),
+            referenceName: getNodeText(typeNode, this.source),
             referenceKind: 'references',
-            line: node.startPosition.row + 1,
-            column: node.startPosition.column,
+            line: typeNode.startPosition.row + 1,
+            column: typeNode.startPosition.column,
           });
         }
       }
@@ -6848,15 +6985,18 @@ export class TreeSitterExtractor {
         }
       }
 
-      // Go interface embedding: `type Querier interface { LabelQuerier; ... }`
-      // constraint_elem wraps the embedded interface type identifier
-      if (child.type === 'constraint_elem') {
-        const typeId = child.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
+      // Go interface embedding: `type IRouter interface { IRoutes; Group(…) }`.
+      // tree-sitter-go parses every element of an interface that is not a
+      // method as a `type_elem`; one holding a single named type embeds that
+      // interface. A union (`float32 | float64`), an underlying type (`~int`)
+      // or a lone basic type (`int64`) is a type-set constraint instead.
+      if (this.language === 'go' && child.type === 'type_elem') {
+        const terms = child.namedChildren.filter((c: SyntaxNode) => c.type !== 'comment');
+        const typeId = terms.length === 1 ? goEmbeddedTypeName(terms[0], this.source) : undefined;
         if (typeId) {
-          const name = getNodeText(typeId, this.source);
           this.unresolvedReferences.push({
             fromNodeId: classId,
-            referenceName: name,
+            referenceName: getNodeText(typeId, this.source),
             referenceKind: 'extends',
             line: typeId.startPosition.row + 1,
             column: typeId.startPosition.column,
@@ -6865,21 +7005,23 @@ export class TreeSitterExtractor {
       }
 
       // Go struct embedding: field_declaration without field_identifier
-      // e.g. `type DB struct { *Head; Queryable }` — no field name means embedded type
-      if (child.type === 'field_declaration') {
+      // e.g. `type DB struct { *Head; Queryable; sync.Mutex }` — no field name
+      // means an embedded type, read the way an interface's is.
+      // Go only: C, C++ and Objective-C members are field_declarations too, but
+      // nest their name inside the declarator (`Cache* cache_;`, `jv elems[];`,
+      // `Status Get(int);`), so this test read every such member's type as a
+      // supertype. Their supertypes come from base_class_clause / superclass.
+      if (this.language === 'go' && child.type === 'field_declaration') {
         const hasFieldIdentifier = child.namedChildren.some((c: SyntaxNode) => c.type === 'field_identifier');
-        if (!hasFieldIdentifier) {
-          const typeId = child.namedChildren.find((c: SyntaxNode) => c.type === 'type_identifier');
-          if (typeId) {
-            const name = getNodeText(typeId, this.source);
-            this.unresolvedReferences.push({
-              fromNodeId: classId,
-              referenceName: name,
-              referenceKind: 'extends',
-              line: typeId.startPosition.row + 1,
-              column: typeId.startPosition.column,
-            });
-          }
+        const typeId = hasFieldIdentifier ? undefined : goEmbeddedTypeName(getChildByField(child, 'type'), this.source);
+        if (typeId) {
+          this.unresolvedReferences.push({
+            fromNodeId: classId,
+            referenceName: getNodeText(typeId, this.source),
+            referenceKind: 'extends',
+            line: typeId.startPosition.row + 1,
+            column: typeId.startPosition.column,
+          });
         }
       }
 
@@ -7168,6 +7310,18 @@ export class TreeSitterExtractor {
             c.type === 'constructor_signature' ||
             c.type === 'factory_constructor_signature'
         ) ?? node;
+      }
+      // A redirecting factory names the class it constructs after `=`, then
+      // perhaps that class's constructor (`= _$QuestionImpl.fromJson`, which
+      // parses as two type_identifiers). Neither the constructor nor an import
+      // prefix is a type, and Dart writes types UpperCamel.
+      if (sig.type === 'redirecting_factory_constructor_signature') {
+        for (const child of sig.namedChildren) {
+          if (child.type !== 'type_identifier' || /^[_$]*[A-Z]/.test(child.text)) {
+            this.extractTypeRefsFromSubtree(child, nodeId);
+          }
+        }
+        return;
       }
       this.extractTypeRefsFromSubtree(sig, nodeId);
       return;
