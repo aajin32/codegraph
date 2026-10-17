@@ -9517,7 +9517,7 @@ function cppOwnTemplateParameters(fn: Node, context: ResolutionContext): string[
   const lines = context.getFileLines?.(fn.filePath) ?? context.readFile(fn.filePath)?.split(/\r?\n/);
   if (!lines) return [];
   const at = lines[fn.startLine - 1] ?? '';
-  const before = [...lines.slice(Math.max(0, fn.startLine - 4), fn.startLine - 1), at.slice(0, fn.startColumn)]
+  const before = [...lines.slice(Math.max(0, fn.startLine - 9), fn.startLine - 1), at.slice(0, fn.startColumn)]
     .map((line) => cppCodeOf(line) ?? '').join(' ').trimEnd();
   let depth = 0;
   for (let i = before.endsWith('>') ? before.length - 1 : -1; i >= 0; i--) {
@@ -9620,31 +9620,23 @@ function cppWrittenClass(type: CppWrittenType, at: UnresolvedRef, context: Resol
   return found && CPP_CLASS_KINDS.has(found.node.kind) ? found.node : null;
 }
 
-/**
- * The type the C++ class `cls` declares its data member `name` with, as
- * written, in the class's scope: `std::vector<SubcompactionState>` for
- * rocksdb's `CompactionState::sub_compact_states`. Data members are not
- * indexed, so the class's own lines are read — one inside none of the
- * functions or classes nested in it. Null when none of them declares it
- * (a base class may).
- */
-function cppDataMemberType(cls: string, name: string, context: ResolutionContext): CppWrittenType | null {
-  for (const decl of context.getNodesByQualifiedName(cls)) {
-    const member = cppDataMemberIn(decl, name, context);
-    if (member) return member;
-  }
-  return null;
-}
-
 const CPP_DATA_MEMBERS = new WeakMap<ResolutionContext, Map<string, CppWrittenType | null>>();
 const CPP_NESTED_SPANS = new WeakMap<ResolutionContext, Map<string, Array<[number, number]>>>();
 const CPP_CLASS_PAREN_DEPTHS = new WeakMap<ResolutionContext, Map<string, number[]>>();
 
 /**
- * cppDataMemberType for one declaration of the class, `decl`. A declarator
- * inside parentheses is a parameter of a method the class declares — which
- * has no node of its own, so its lines are the class's — not a member:
- * rocksdb's `DB` declares `CreateColumnFamilies(const
+ * The type the C++ class `decl` declares its data member `name` with, as
+ * written, in the class's scope: `std::vector<SubcompactionState>` for
+ * rocksdb's `CompactionState::sub_compact_states`. Data members are not
+ * indexed, so the class's own lines are read — one inside none of the
+ * functions or classes nested in it. Null when none of them declares it
+ * (a base class may). Only `decl`'s own: a class of the same qualified name
+ * another file declares for itself is another class — rocksdb's
+ * `db_bench_tool.cc` and `db_stress_shared_state.h` each declare a
+ * `ThreadState`, whose `rand` is a `Random64` in one and a `Random` in the
+ * other. A declarator inside parentheses is a parameter of a method the
+ * class declares — which has no node of its own, so its lines are the
+ * class's — not a member: rocksdb's `DB` declares `CreateColumnFamilies(const
  * std::vector<ColumnFamilyDescriptor>& column_families, …)`. Nor is a name
  * an argument list follows, a method.
  */
@@ -9920,10 +9912,11 @@ const CPP_LIBRARY_ADAPTORS: ReadonlySet<string> = new Set(['stack', 'queue', 'pr
  */
 function cppLibraryElementOf(object: CppWrittenType, member: string, at: UnresolvedRef, context: ResolutionContext): CppWrittenType | null {
   if (isCppPointerType(object.text)) return null;
-  const text = cppWithoutTypeKeywords(object.text);
-  const segments = cppTypeSegments(text);
+  const segments = cppTypeSegments(cppWithoutTypeKeywords(object.text));
   const last = segments?.[segments.length - 1];
   if (!segments || !last) return null;
+  // (Its own `const` and `&` aside: a `const` in a template argument, `std::shared_ptr<const Message>`, stays.)
+  const text = object.text.replace(/^\s*(?:typename\s+)?const\s+/, '').replace(/(?:\s*\bconst\b)?\s*&+\s*$/, '').trim();
   const library = segments[0] === 'std' || segments[0] === 'absl';
   if (member === 'front' || member === 'back' || member === 'at') {
     if ((library && CPP_LIBRARY_SEQUENCES.has(last)) || CPP_PROJECT_SEQUENCES.has(last)) return cppRangeElementOf(object, at, context);
@@ -10023,14 +10016,17 @@ function cppExpressionType(expr: string, at: UnresolvedRef, context: ResolutionC
     return followed && cppSubscriptElement(followed, at, context);
   }
   if (!text.endsWith(')')) {
-    // `compact_->sub_compact_states`: a data member of the object's class;
-    // `it->second` through a map's iterator: the member of the `std::pair`.
+    // `compact_->sub_compact_states`: a data member of the object's class, or
+    // of a class it derives from — rocksdb's `Options` declares none of its
+    // own, and inherits `table_factory`, `statistics` and the rest from
+    // `DBOptions` and `ColumnFamilyOptions`; `it->second` through a map's
+    // iterator: the member of the `std::pair`.
     const field = /^(.+?)\s*(\.|->)\s*([A-Za-z_]\w*)$/.exec(text);
     const object = field && cppMemberObject(field[1]!, field[2]!, at, context, depth);
     const element = object && cppPairMember(object, field![3]!, at, context);
     if (element) return element;
     const cls = object && cppWrittenClass(object, at, context);
-    return cls ? cppDataMemberType(cls.qualifiedName, field![3]!, context) : null;
+    return cls ? cppInheritedDataMember([cls], field![3]!, context, 0, new Set([cls.qualifiedName])) : null;
   }
   const open = cppOpeningParen(text, text.length - 1);
   const callee = open > 0 ? text.slice(0, open).trim() : '';
@@ -10270,6 +10266,8 @@ interface CppReceiverDeclaration {
   classTemplate?: boolean;
   /** The declared type as written (`std::vector<Slice>*`). */
   raw?: string;
+  /** A `const` the declaration writes before its type (`const Buffer* b`), which `raw` leaves out. */
+  constant?: boolean;
   /** The array dimensions the declarator gives the receiver (`Status statuses[3]`), which `raw` doesn't show. */
   array?: number;
   /** The declaration is the calling function's own, or a member of its class (isCppCallersDeclaration). */
@@ -11022,6 +11020,74 @@ function cppUnspelledReceiver(ref: UnresolvedRef, context: ResolutionContext): {
   return index === null ? null : at(index);
 }
 
+/** A member chain and the operator after it: `props->rep.db_id` and `.`, `this->mu_` and `->`. */
+const CPP_MEMBER_CHAIN = /^([A-Za-z_]\w*(?:\s*(?:\.|->)\s*[A-Za-z_]\w*)*)\s*(\.|->)\s*(?:template\s+)?/;
+
+/**
+ * The member chain a C++ call the extractor recorded by its bare name is made
+ * on, with the operator after it — `options.cf_paths` and `.` for
+ * `options.cf_paths.emplace_back(…)`, `props->rep.db_id` and `.` for
+ * `props->rep.db_id.size()` — read at the call's column, where the chain
+ * starts. Null for any other call, a receiver of one name among them (the
+ * extractor spells those).
+ */
+function cppMemberChainReceiver(ref: UnresolvedRef, context: ResolutionContext): { expression: string; op: string } | null {
+  const raw = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1];
+  const line = raw === undefined ? null : cppCodeOf(cppLiteralsBlanked(raw, ref.line, cppNonCodeLines(ref.filePath, context)));
+  if (!line) return null;
+  const at = (column: number): { expression: string; op: string } | null => {
+    const chain = CPP_MEMBER_CHAIN.exec(line.slice(column));
+    if (!chain || !/\.|->/.test(chain[1]!)) return null;
+    const rest = line.slice(column + chain[0].length);
+    if (!rest.startsWith(ref.referenceName) || /[\w$]/.test(rest.charAt(ref.referenceName.length))) return null;
+    return cppArgumentListFollows(rest, ref.referenceName.length) ? { expression: chain[1]!, op: chain[2]! } : null;
+  };
+  const found = at(Math.max(0, ref.column));
+  if (found || !/[^\x00-\x7f]/.test(line)) return found;
+  const index = cppUtf8Column(line, ref.column);
+  return index === null ? null : at(index);
+}
+
+/**
+ * A C++ call on a data member reached through a member chain, which the
+ * extractor records by its bare name, calls a member of the class that
+ * member's type names, looked up as C++ looks it up where the type is
+ * written (cppMemberObject reads each member's declared type in its class).
+ * By its bare name the call went to whichever class had a method of that
+ * name, or, in a method, to the method's own class: rocksdb's
+ * `thread->rnd.Next()` on a `Random rnd` reached `ArenaWrappedDBIter::Next`,
+ * `meta.smallest.user_key()` on an `InternalKey` `ClippingIterator::user_key`,
+ * and `options.cf_paths.emplace_back(…)` on a `std::vector<DbPath>`
+ * `autovector::emplace_back`. Unlike a call chain's, a member chain's
+ * operator is read where it is written, so a library template of a template
+ * parameter is no matter: `.` calls a member of `std::vector<T>` itself, and
+ * `->` on a `std::unique_ptr<T>` one of `T`.
+ *  - The member of that class, or of a class it derives from.
+ *  - null when no project method is called: a type from outside the project,
+ *    a library type (isCppLibraryType) or one under a namespace the project
+ *    declares nothing in (isCppOutsideQualifiedType); a template parameter's
+ *    type the calling function writes; or a class that surely lacks the
+ *    method (cppLacksMethod).
+ *  - undefined for any other call, or a member whose type can't be read or
+ *    placed: the name strategies decide, as before.
+ */
+function matchCppMemberChainCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const receiver = cppMemberChainReceiver(ref, context);
+  if (!receiver) return undefined;
+  const object = cppMemberObject(receiver.expression, receiver.op, ref, context, 0);
+  if (!object || isCppPointerType(object.text)) return undefined;
+  if (isCppLibraryType(object.text, context)) return null;
+  const found = cppClassWritten(object.text, object, ref, context);
+  if (found === undefined) return isCppOutsideQualifiedType(object.text, object, context) ? null : undefined;
+  // (As for an unspelled receiver: a template parameter another template
+  // writes is what the call's specialization makes it.)
+  if (found === null) return isCppTemplateParameterType(object) && object.scope !== context.getNodeById?.(ref.fromNodeId)?.qualifiedName ? undefined : null;
+  if (!found.exact || !CPP_CLASS_KINDS.has(found.node.kind)) return undefined;
+  const method = cppMethodOf(found.node, ref.referenceName, ref, context);
+  if (method) return { original: ref, targetNodeId: method.id, confidence: 0.9, resolvedBy: 'instance-method' };
+  return cppLacksMethod(found.node, context) ? null : undefined;
+}
+
 /**
  * A C++ call the extractor recorded by its bare name on a receiver it drops
  * (cppUnspelledReceiver) — `(*it)->Visit()` over a `std::vector<Node*>`,
@@ -11232,22 +11298,65 @@ function cppOverloadFor(candidates: Node[], name: string, ref: UnresolvedRef, co
 /**
  * Of overloads the call's arguments `args` fit alike by count (in
  * preference order), the one the types the arguments have where the call
- * reads them fit best (cppArgumentTypeFit); the first on a tie.
+ * reads them fit best (cppArgumentTypeFit); the first on a tie, unless a
+ * const twin of it fits the arguments' constness better (cppConstTwinChoice).
  */
 function cppArgumentTypeChoice(tied: Node[], name: string, args: string[], ref: UnresolvedRef, context: ResolutionContext): Node {
   if (tied.length === 1 || args.length === 0) return tied[0]!;
   const types = args.map((arg) => cppArgumentType(arg, ref, context));
   if (types.every((t) => t === null)) return tied[0]!;
-  let best = tied[0]!;
-  let bestFit = cppArgumentTypeFit(best, name, types, context);
-  for (const n of tied.slice(1)) {
-    const fit = cppArgumentTypeFit(n, name, types, context);
-    if (fit > bestFit) {
-      best = n;
-      bestFit = fit;
+  const fits = tied.map((n) => cppArgumentTypeFit(n, name, types, context));
+  const top = Math.max(...fits);
+  const best = tied[fits.indexOf(top)]!;
+  return cppConstTwinChoice(best, tied.filter((n, i) => fits[i] === top && n !== best), name, types, context);
+}
+
+/**
+ * `best`, or of its twins among `others` — overloads alike but for the
+ * `const` of a pointer or reference parameter — the one that adds `const` to
+ * the fewest of the arguments `types`, as C++ ranks them: protobuf's
+ * `DynamicCastMessage<T>(ptr.get())` on a `std::shared_ptr<Message> ptr` is
+ * `T* DynamicCastMessage(MessageLite* from)`, not the `const T*
+ * DynamicCastMessage(const MessageLite* from)` declared before it. (A const
+ * object fits only the const twin: cppWrittenTypeFit.)
+ */
+function cppConstTwinChoice(best: Node, others: Node[], name: string, types: Array<CppArgumentType | null>, context: ResolutionContext): Node {
+  if (others.length === 0) return best;
+  const shape = cppConstlessParameters(best, name, context)?.join(',');
+  if (shape === undefined) return best;
+  let choice = best;
+  let added = cppConstAdded(best, name, types, context);
+  for (const n of others) {
+    if (cppConstlessParameters(n, name, context)?.join(',') !== shape) continue;
+    const count = cppConstAdded(n, name, types, context);
+    if (count < added) {
+      choice = n;
+      added = count;
     }
   }
-  return best;
+  return choice;
+}
+
+/** An overload's parameter types without their `const`s: what its const twins share. */
+function cppConstlessParameters(n: Node, name: string, context: ResolutionContext): string[] | null {
+  const list = cppOverloadParameters(n, name, context);
+  if (list === null) return null;
+  return splitCppTopLevel(cppWithoutComments(list)).filter((p) => p !== 'void')
+    .map((p) => cppParameterType(p).replace(/\bconst\b/g, ' ').replace(/\s+/g, ''));
+}
+
+/** How many of the arguments `types` an overload's pointer or reference parameters add `const` to. */
+function cppConstAdded(n: Node, name: string, types: Array<CppArgumentType | null>, context: ResolutionContext): number {
+  const list = cppOverloadParameters(n, name, context);
+  if (list === null) return 0;
+  const params = splitCppTopLevel(cppWithoutComments(list)).filter((p) => p !== 'void');
+  let count = 0;
+  for (let i = 0; i < types.length && i < params.length; i++) {
+    const arg = types[i];
+    const param = cppParameterType(params[i]!);
+    if (arg?.kind === 'type' && cppRefersToConst(param) === true && cppArgumentConst(arg.text, param) === false) count++;
+  }
+  return count;
 }
 
 /**
@@ -11415,7 +11524,9 @@ function isCppDeletedFunction(n: Node, name: string, context: ResolutionContext)
 }
 
 /** What a C++ call's argument is: a literal's kind, or the type a name or expression has as written. */
-type CppArgumentType = { kind: 'char' | 'number' | 'zero' | 'bool' | 'null' } | { kind: 'type'; text: string };
+type CppArgumentType =
+  | { kind: 'char' | 'number' | 'zero' | 'bool' | 'null' }
+  | { kind: 'type'; text: string; lvalue?: boolean; dependent?: boolean };
 
 /**
  * What the argument `arg` of the call at `ref` is, where that can be read: a
@@ -11437,12 +11548,43 @@ function cppArgumentType(arg: string, ref: UnresolvedRef, context: ResolutionCon
   if (name) {
     const decl: CppReceiverDeclaration = {};
     inferCppReceiverType(name, ref, context, 0, decl);
-    const written = decl.declared?.text ?? decl.raw;
-    if (!written || !decl.callers || decl.shadowed) return null;
-    return { kind: 'type', text: address ? `${written}*` : written };
+    const declared = decl.declared?.text ?? decl.raw;
+    if (!declared || !decl.callers || decl.shadowed) return null;
+    const written = decl.constant && !/^\s*const\b/.test(declared) ? `const ${declared}` : declared;
+    // (An array is a pointer to its element: fmt's `format_base2e(4, buf, …)` on a `Char buf[8]` is the `Char* out` overload.)
+    const typed = address || decl.array ? `${written.replace(/\s*&+\s*$/, '')}*` : written;
+    return { kind: 'type', text: typed, lvalue: !address, dependent: isCppDependentArgument(typed, ref, context) };
   }
   const typed = /^(?:u8|u|U|L)?R?["']/.test(text) ? null : cppExpressionType(text, ref, context, 0);
-  return typed ? { kind: 'type', text: typed.text } : null;
+  return typed
+    ? { kind: 'type', text: typed.text, lvalue: cppNamesObject(text, typed.text), dependent: isCppDependentArgument(typed.text, ref, context) }
+    : null;
+}
+
+/**
+ * Whether an argument of the written type `type` has the type of a template
+ * parameter of the calling function or its class (fmt's `const S& fmt`),
+ * which could be a pointer as well as an object.
+ */
+function isCppDependentArgument(type: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const name = normalizeCppTypeName(type);
+  const caller = name ? context.getNodeById?.(ref.fromNodeId) : null;
+  return !!caller && cppTemplateParameters(caller, context).has(name!);
+}
+
+/**
+ * Whether the C++ argument `expr`, of the written type `type`, names an
+ * object, which a reference to a non-const type can bind: a dereference, a
+ * subscript, a member, or a call that returns an lvalue reference. False for
+ * a call that returns a value; undefined when that can't be told.
+ */
+function cppNamesObject(expr: string, type: string): boolean | undefined {
+  let text = expr.trim();
+  while (text.startsWith('(') && text.endsWith(')') && cppOpeningParen(text, text.length - 1) === 0) text = text.slice(1, -1).trim();
+  if (text.startsWith('*') || text.endsWith(']')) return true;
+  if (!text.endsWith(')')) return /^[A-Za-z_][\w\s.:>-]*$/.test(text) ? true : undefined;
+  if (/&&\s*$/.test(type)) return undefined;
+  return /&\s*$/.test(type);
 }
 
 /** What a C++ type is, for an argument to fit a parameter of it. */
@@ -11482,13 +11624,18 @@ function cppArgumentTypeFit(n: Node, name: string, types: Array<CppArgumentType 
   const list = cppOverloadParameters(n, name, context);
   if (list === null) return 0;
   const params = splitCppTopLevel(cppWithoutComments(list)).filter((p) => p !== 'void');
+  const own = types.some((t) => t?.kind === 'type') ? cppOwnTemplateParameters(n, context) : [];
   let score = 0;
   for (let i = 0; i < types.length && i < params.length; i++) {
     const arg = types[i];
     const param = cppParameterType(params[i]!);
     if (!arg || param.includes('...')) continue;
     const category = cppTypeCategory(param);
-    score += arg.kind === 'type' ? cppWrittenTypeFit(arg.text, param, category) : CPP_LITERAL_FIT[arg.kind][category];
+    // (A parameter of the function's own template parameter's type, `T* x`, takes the argument's `const` into `T`.)
+    const deduced = own.length > 0 && own.includes(normalizeCppTypeName(param) ?? '');
+    score += arg.kind === 'type'
+      ? cppWrittenTypeFit(arg.text, param, category, { lvalue: arg.lvalue, dependent: arg.dependent, deduced })
+      : CPP_LITERAL_FIT[arg.kind][category];
   }
   return score;
 }
@@ -11506,8 +11653,66 @@ const CPP_LITERAL_FIT: Record<'char' | 'number' | 'zero' | 'bool' | 'null', Reco
   null: { null: 4, pointer: 3, cstring: 3, class: 1, string: -3, char: -3, number: -3, bool: -1 },
 };
 
-/** How an argument written as type `arg` fits a parameter of type `param` (of category `category`). */
-function cppWrittenTypeFit(arg: string, param: string, category: CppTypeCategory): number {
+/**
+ * How an argument written as type `arg` fits a parameter of type `param` (of
+ * category `category`). An object is no pointer, nor a pointer to characters
+ * a pointer to anything but characters or `void`, or the other way round:
+ * protobuf's `DynamicCastMessage<T>(*msg)` takes a reference, and rocksdb's
+ * `db_->Put(opts, key, ts, value)` on a `char key[]` no `ColumnFamilyHandle*`.
+ * A pointer or reference to a non-const type never takes a const object,
+ * nor a reference a value a call returns (`lvalue` false). None of that
+ * holds for an argument of a template parameter's type (`dependent`), and
+ * the pointer and `const` rules not for a parameter whose type the function's
+ * own template parameter is (`deduced`). (Of two overloads alike but for a
+ * `const`, which one a non-const object takes is cppConstTwinChoice's.)
+ */
+function cppWrittenTypeFit(
+  arg: string,
+  param: string,
+  category: CppTypeCategory,
+  how: { lvalue?: boolean; dependent?: boolean; deduced?: boolean } = {},
+): number {
+  const fit = cppUnqualifiedTypeFit(arg, param, category);
+  if (fit < 0 || how.dependent) return fit;
+  const argCategory = cppTypeCategory(arg);
+  if (category === 'pointer' && argCategory === 'class') return -3;
+  if (!how.deduced && category === 'pointer' && argCategory === 'cstring' && !/\bvoid\b/.test(param)) return -3;
+  if (category === 'cstring' && argCategory === 'pointer') return -3;
+  if (cppRefersToConst(param) !== false) return fit;
+  if (!how.deduced && cppArgumentConst(arg, param) === true) return -3;
+  return how.lvalue === false && !/\*/.test(stripCppTemplateArguments(param)) ? -3 : fit;
+}
+
+/**
+ * Whether the object an argument of the written type `arg` gives a pointer
+ * or reference parameter `param` is const: what the pointer points at, or
+ * the object itself. Undefined when the argument is no such thing.
+ */
+function cppArgumentConst(arg: string, param: string): boolean | undefined {
+  const argPointer = /\*/.test(stripCppTemplateArguments(arg));
+  if (/\*/.test(stripCppTemplateArguments(param))) return argPointer ? cppRefersToConst(arg) : undefined;
+  return argPointer ? undefined : cppIsConstObject(arg);
+}
+
+/**
+ * Whether the C++ type `type`, a pointer or an lvalue reference of one
+ * level, refers to a const object: `const T*`, `T const&`. (A pointer's own
+ * `const`, `T* const`, is not the object's.) Undefined for any other type.
+ */
+function cppRefersToConst(type: string): boolean | undefined {
+  const text = stripCppTemplateArguments(type).trim();
+  const stars = (text.match(/\*/g) ?? []).length;
+  if (stars > 1 || (stars === 0 && !/[^&]&\s*$/.test(text))) return undefined;
+  return /\bconst\b/.test(stars === 1 ? text.slice(0, text.indexOf('*')) : text);
+}
+
+/** Whether a C++ object of the written type `type`, a value or a reference, is const. */
+function cppIsConstObject(type: string): boolean {
+  return /\bconst\b/.test(stripCppTemplateArguments(type));
+}
+
+/** How an argument written as type `arg` fits a parameter of type `param`, `const` aside. */
+function cppUnqualifiedTypeFit(arg: string, param: string, category: CppTypeCategory): number {
   const argCategory = cppTypeCategory(arg);
   const pointer = (c: CppTypeCategory): boolean => c === 'pointer' || c === 'cstring';
   if (normalizeCppTypeName(arg) === normalizeCppTypeName(param) && pointer(argCategory) === pointer(category)) return 3;
@@ -11699,12 +11904,16 @@ function cppRebindsReceiver(line: string, escapedReceiver: string): boolean {
 }
 
 /** Record the C++ declaration receiver inference settles on, with the array dimensions its declarator gives it. */
-function noteCppDeclaration(found: CppReceiverDeclaration | undefined, raw: string, callers: boolean, array = 0): void {
+/** A `const` (or `constexpr`) right before a declarator's type: `(Writer& w, const ` of `const Buffer* b`. */
+const CPP_LEADING_CONST = /\b(?:const|constexpr)\s+$/;
+
+function noteCppDeclaration(found: CppReceiverDeclaration | undefined, raw: string, callers: boolean, array = 0, constant = false): void {
   if (!found) return;
   found.raw = raw;
   found.callers = callers;
   found.pointer = isCppPointerType(raw);
   found.array = array > 0 ? array : undefined;
+  found.constant = constant || undefined;
 }
 
 /**
@@ -11791,7 +12000,7 @@ function inferCppReceiverType(
       } else if (normalized) {
         const inCallerScope = isCppCallersDeclaration(ref.filePath, i + 1, ref, context);
         const array = cppArrayDimensions(line.slice(declaratorMatch.index + declaratorMatch[0].length));
-        noteCppDeclaration(found, declaratorMatch[1]!, inCallerScope, array);
+        noteCppDeclaration(found, declaratorMatch[1]!, inCallerScope, array, CPP_LEADING_CONST.test(line.slice(0, declaratorMatch.index)));
         return cppDeclaredType(declaratorMatch[1]!, normalized, inCallerScope, ref, context, found);
       } else if (cppTypeBeganAbove(declaratorMatch[1] ?? '')) {
         // The end of a declaration begun on an earlier line, maybe the
@@ -11872,7 +12081,7 @@ function inferCppReceiverType(
       if (normalized && normalized !== 'auto') {
         const inCallerScope = isCppCallersDeclaration(headerPath, i + 1, ref, context);
         const array = cppArrayDimensions(line.slice(declaratorMatch.index + declaratorMatch[0].length));
-        noteCppDeclaration(found, declaratorMatch[1]!, inCallerScope, array);
+        noteCppDeclaration(found, declaratorMatch[1]!, inCallerScope, array, CPP_LEADING_CONST.test(line.slice(0, declaratorMatch.index)));
         return cppDeclaredType(declaratorMatch[1]!, normalized, inCallerScope, ref, context, found);
       }
     }
@@ -16824,6 +17033,9 @@ function matchReferenceInner(
   if (ref.language === 'cpp' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)) {
     const unspelled = nmTimedT('cppUnspelled', ref, () => matchCppUnspelledReceiverCall(ref, context));
     if (unspelled !== undefined) return unspelled;
+    // So is one on a member reached through a chain, `thread->rnd.Next()`.
+    const chained = nmTimedT('cppMemberChain', ref, () => matchCppMemberChainCall(ref, context));
+    if (chained !== undefined) return chained;
   }
 
   // Try strategies in order of confidence
