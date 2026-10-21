@@ -1398,9 +1398,15 @@ impl<'t> Walker<'t> {
         if self.stack.is_empty() {
             return;
         }
-        let func = node
-            .child_by_field_name("function")
-            .or_else(|| node.named_child(0));
+        let raw = node.child_by_field_name("function").or_else(|| node.named_child(0));
+        let func = raw.map(|f| self.peel_await_callee(f));
+        // Where the reference sits: the call, or the callee an `await` was
+        // peeled off (`await f<T>(x)` starts at `await`; the call to `f`
+        // starts where `f` does, as in `await f(x)`). Mirrors refStart.
+        let at = match (raw, func) {
+            (Some(r), Some(f)) if r.id() != f.id() => f,
+            _ => node,
+        };
         let mut callee_name = String::new();
 
         if let Some(func) = func {
@@ -1476,7 +1482,7 @@ impl<'t> Walker<'t> {
         }
 
         if !callee_name.is_empty() {
-            self.push_call_ref(&callee_name.clone(), node);
+            self.push_call_ref(&callee_name.clone(), at);
         }
     }
 
@@ -1498,10 +1504,26 @@ impl<'t> Walker<'t> {
         Some(self.text(property).to_string())
     }
 
+    /// `await f<T>(x)` parses with `await f` as the callee; the call is to
+    /// `f` (#2586). Peels every `await`, skipping a comment written after one.
+    /// TS-family only. Mirrors peelTsAwaitCallee.
+    fn peel_await_callee(&self, node: Node<'t>) -> Node<'t> {
+        if !self.variant.is_ts() {
+            return node;
+        }
+        let mut cur = node;
+        while cur.kind() == "await_expression" {
+            let mut walker = cur.walk();
+            let Some(inner) = cur.named_children(&mut walker).find(|c| c.kind() != "comment") else { break };
+            cur = inner;
+        }
+        cur
+    }
+
     /// The callee of a call-expression receiver when it is a plain identifier
     /// or member chain (`make`, `d.setdefault`), whitespace stripped (#1683).
     fn plain_inner_callee(&self, call: Node<'t>) -> Option<String> {
-        let inner = call.child_by_field_name("function")?;
+        let inner = self.peel_await_callee(call.child_by_field_name("function")?);
         Self::plain_member_name(self.text(inner))
     }
 
@@ -1670,6 +1692,22 @@ impl<'t> Walker<'t> {
                             let name = self.text(iface).to_string();
                             self.push_ref(class_row, &name, implements_kind, iface);
                         }
+                    }
+                }
+                // TS `interface Repo<T> extends Base, ns.Shape, Store<T>` — each
+                // supertype is a `type` of the clause; a `generic_type` is named
+                // by its `name` field (`Store`, never `Store<T>`).
+                "extends_type_clause" => {
+                    let mut cursor = child.walk();
+                    let targets: Vec<Node<'t>> = child.children_by_field_name("type", &mut cursor).collect();
+                    for target in targets {
+                        let named = if target.kind() == "generic_type" {
+                            target.child_by_field_name("name").unwrap_or(target)
+                        } else {
+                            target
+                        };
+                        let name = self.text(named).to_string();
+                        self.push_ref(class_row, &name, extends_kind, target);
                     }
                 }
                 // JS `class Foo extends Bar` — class_heritage holds a bare

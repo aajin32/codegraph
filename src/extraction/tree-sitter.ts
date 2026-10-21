@@ -24,7 +24,7 @@ import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs, isCppConstructorDeclaration, cDeclaratorIdentifier, isClassLikeDefinition } from './languages/c-cpp';
 import { NestedIntervals, scanCppBraceScopes, type CppBraceScopes } from './languages/cpp-brace-scopes';
 import { appendCppMacroMethods } from './languages/cpp-macro-methods';
-import { rustImplTypeName } from './languages/rust';
+import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
 import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeRefs } from './languages/dart';
 import { LiquidExtractor } from './liquid-extractor';
@@ -486,6 +486,33 @@ function peelSwiftCallWrappers(node: SyntaxNode, source: string): SyntaxNode {
 }
 
 /**
+ * A Rust callee path without its turbofish type arguments: `Vec::<u8>::new`
+ * calls `Vec::new`, `Store::with_capacity::<u8>` calls `Store::with_capacity`.
+ * The arguments' brackets nest (`::<Vec<u8>>`), and the `>` of a `->` is no
+ * closing one (`::<fn() -> u8>`). Mirrored in the kernel's strip_turbofish
+ * (rustlang.rs): both emit the same bytes.
+ */
+function stripRustTurbofish(text: string): string {
+  if (!text.includes('::<')) return text;
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    if (text.startsWith('::<', i)) {
+      let depth = 0;
+      let j = i + 2;
+      for (; j < text.length; j++) {
+        const c = text[j];
+        if (c === '<') depth++;
+        else if (c === '>' && text[j - 1] !== '-' && --depth === 0) break;
+      }
+      i = j;
+      continue;
+    }
+    out += text[i];
+  }
+  return out;
+}
+
+/**
  * A Swift receiver's text from its innermost wrapped operand on: the wrappers
  * sit on the chain's left edge, so `!Settings.Defaults` reads
  * `Settings.Defaults` and `try! Foo.make().bar` reads `Foo.make().bar`.
@@ -529,6 +556,21 @@ const TS_JS_TRANSPARENT_RECEIVER_TYPES = new Set([
   'parenthesized_expression', 'non_null_expression', 'as_expression',
   'satisfies_expression', 'type_assertion', 'await_expression',
 ]);
+
+/**
+ * tree-sitter-typescript parses `await f<T>(x)` as a call whose callee is
+ * `await f` (#2586); the call is to `f`. Peels every `await`, skipping a
+ * comment written after one. Mirrored in the kernel (tsjs/extractors.rs).
+ */
+function peelTsAwaitCallee(node: SyntaxNode): SyntaxNode {
+  let cur = node;
+  while (cur.type === 'await_expression') {
+    const inner = cur.namedChildren.find((c: SyntaxNode) => c.type !== 'comment');
+    if (!inner) break;
+    cur = inner;
+  }
+  return cur;
+}
 
 /**
  * Strip {@link TS_JS_TRANSPARENT_RECEIVER_TYPES} wrappers off a receiver.
@@ -1387,6 +1429,12 @@ export class TreeSitterExtractor {
         this.extractFunction(node);
         skipChildren = true; // extractFunction visits children via visitFunctionBody
       }
+    }
+    // A bodiless function that no implementation follows: a TypeScript
+    // `declare function`, a `.d.ts` file's own or its `declare module` body's.
+    else if (nodeType === 'function_signature' && this.extractor.isAmbientFunction?.(node, this.filePath)) {
+      this.extractFunction(node);
+      skipChildren = true;
     }
     // Check for class declarations
     else if (this.extractor.classTypes.includes(nodeType)) {
@@ -3779,6 +3827,8 @@ export class TreeSitterExtractor {
       // Generic fallback for other languages
       // Try to find identifier children
       const nameField = getChildByField(node, 'name');
+      // A Rust impl's associated const is its type's (`Limits::MAX`), as its methods are.
+      const owner = this.language === 'rust' ? rustImplItemOwner(node, this.source) : undefined;
       let declared: Node | null = null;
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
@@ -3791,6 +3841,7 @@ export class TreeSitterExtractor {
             const created = this.createNode(kind, name, child, {
               docstring,
               isExported,
+              ...(owner !== undefined ? { qualifiedName: `${owner}::${name}` } : {}),
             });
             if (created && nameField && child.startIndex === nameField.startIndex) {
               declared = created;
@@ -3986,12 +4037,16 @@ export class TreeSitterExtractor {
       return true;
     }
 
+    const owner = this.language === 'rust' ? rustImplItemOwner(node, this.source) : undefined;
     const typeAliasNode = this.createNode('type_alias', name, node, {
       docstring,
       isExported,
       // A Rust alias is private to its module unless `pub` (any form): the
       // resolver keeps a private one to its own module (isRustNameInScope).
       ...(this.language === 'rust' ? { visibility: this.extractor.getVisibility?.(node) } : {}),
+      // An impl's associated type is its type's (`ValueHint::Err`), named only
+      // through a path, never bare (isRustAssociatedItem).
+      ...(owner !== undefined ? { qualifiedName: `${owner}::${name}` } : {}),
     });
 
     // Extract type references from the alias value (e.g., `type X = ITextModel | null`)
@@ -5237,6 +5292,10 @@ export class TreeSitterExtractor {
 
     // Get the function/method being called
     let calleeName = '';
+    // Where the call's reference sits: the call itself, or the callee an
+    // `await` was peeled off (`await f<T>(x)` starts at `await`; the call to
+    // `f` starts where `f` does, as in `await f(x)`).
+    let refStart = node.startPosition;
 
     // Java/Kotlin method_invocation has 'object' + 'name' fields instead of 'function'
     // PHP member_call_expression has 'object' + 'name', scoped_call_expression has 'scope' + 'name'
@@ -5417,6 +5476,11 @@ export class TreeSitterExtractor {
       }
     } else {
       let func = getChildByField(node, 'function') || node.namedChild(0);
+      if (func && (this.language === 'typescript' || this.language === 'tsx' || this.language === 'arkts')) {
+        const peeled = peelTsAwaitCallee(func);
+        if (peeled !== func) refStart = peeled.startPosition;
+        func = peeled;
+      }
 
       if (func && this.language === 'swift') {
         // `-(a + b)`: an operator token applied to a parenthesized value
@@ -5426,6 +5490,15 @@ export class TreeSitterExtractor {
         // Mirrored in the kernel's extract_call (swift.rs).
         if (func.type === 'call_suffix') return;
         func = peelSwiftCallWrappers(func, this.source);
+      }
+
+      // A Rust turbofish — `s.get::<u32>()`, `helper::<u8>()`,
+      // `Store::with_capacity::<u8>(1)` — calls the function it wraps: its type
+      // arguments are no part of the callee's name, which stayed in the ref
+      // (`s.get::<u32>`) and resolved through no strategy. Mirrored in the
+      // kernel's extract_call (rustlang.rs).
+      if (func && this.language === 'rust' && func.type === 'generic_function') {
+        func = getChildByField(func, 'function') ?? func;
       }
 
       // C++ explicit operator call `a.operator+(b)` / `p->operator+(b)` (#1247):
@@ -5603,10 +5676,16 @@ export class TreeSitterExtractor {
                 // fluent codebases. Leave those to the bare-name path.
                 reencode = /^[A-Z]/.test(innerCallee);
               } else {
-                const innerFn = getChildByField(receiver, 'function');
+                let innerFn = getChildByField(receiver, 'function');
+                // Rust: the inner call's turbofish is no part of its name either
+                // (`Foo::create::<T>().run()`, `Vec::<u8>::new().len()`).
+                if (this.language === 'rust' && innerFn?.type === 'generic_function') {
+                  innerFn = getChildByField(innerFn, 'function') ?? innerFn;
+                }
                 innerCallee = innerFn
                   ? getNodeText(innerFn, this.source).replace(/->/g, '.').replace(/\s+/g, '')
                   : '';
+                if (this.language === 'rust') innerCallee = stripRustTurbofish(innerCallee);
                 // Rust: only re-encode an associated-function chain
                 // (`Foo::new().bar()`), whose inner callee is a path/`scoped_identifier`.
                 // Go: only a bare package-level factory chain (`New().Method()`),
@@ -5703,7 +5782,8 @@ export class TreeSitterExtractor {
               // static receiver at all — emit nothing: a silent miss, never a
               // wrong edge. The inner call is visited on its own either way.
               // Mirrored in the kernel (tsjs/extractors.rs, python.rs).
-              const innerFn = getChildByField(receiver, 'function');
+              let innerFn = getChildByField(receiver, 'function');
+              if (innerFn && (this.language === 'typescript' || this.language === 'tsx')) innerFn = peelTsAwaitCallee(innerFn);
               const innerCallee = innerFn ? getNodeText(innerFn, this.source).replace(/\s+/g, '') : '';
               if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(innerCallee)) return;
               calleeName = `${innerCallee}().${methodName}`;
@@ -5747,13 +5827,29 @@ export class TreeSitterExtractor {
               // Emit nothing: a silent miss, never a wrong edge. Mirrored in
               // the kernel's extract_call (tsjs/extractors.rs).
               return;
+            } else if (this.language === 'python' && receiver) {
+              // Any receiver shape the branches above do not claim — attribute
+              // chain (`self.data.append`) and subscript (`d[k].append`). The
+              // call-chain shape (`rows.setdefault(k, []).append(x)`) is taken
+              // by the `<inner>().<method>` branch above (#1748), which runs
+              // first. These previously fell through to a bare methodName. A
+              // bare name matching a common
+              // list/dict/str method (`append`, `get`, `update`, ...) can exact-match
+              // an unrelated top-level project function sharing that name, fabricating
+              // a call edge (#66, same class as #1230/#1276). Keep the receiver's
+              // source text as a qualifier so the ref can only resolve through
+              // import/module-member resolution, never the bare-name fallback; an
+              // unresolvable qualifier is a silent miss, never a wrong edge.
+              const receiverText = getNodeText(receiver, this.source).replace(/\s+/g, ' ').trim();
+              calleeName = receiverText ? `${receiverText}.${methodName}` : methodName;
             } else {
               calleeName = methodName;
             }
           }
         } else if (func.type === 'scoped_identifier' || func.type === 'scoped_call_expression') {
-          // Scoped call: Module::function()
-          calleeName = getNodeText(func, this.source);
+          // Scoped call: Module::function(); a Rust path's turbofish is no
+          // part of the name (`Vec::<u8>::with_capacity` → `Vec::with_capacity`).
+          calleeName = this.language === 'rust' ? stripRustTurbofish(getNodeText(func, this.source)) : getNodeText(func, this.source);
         } else if (this.language === 'csharp' && func.type === 'member_access_expression') {
           // C# member call `recv.Method(...)`. When the receiver is itself a call
           // — a chained factory `Foo.Create(args).Bar()` — encode `inner().Bar`
@@ -5829,8 +5925,8 @@ export class TreeSitterExtractor {
         fromNodeId: callerId,
         referenceName: calleeName,
         referenceKind: 'calls',
-        line: node.startPosition.row + 1,
-        column: node.startPosition.column,
+        line: refStart.row + 1,
+        column: refStart.column,
       });
     }
   }
@@ -7190,6 +7286,24 @@ export class TreeSitterExtractor {
               column: target.startPosition.column,
             });
           }
+        }
+      }
+
+      // TypeScript: `interface Repo<T> extends Base, ns.Shape, Store<T>` — each
+      // supertype is a `type` of the extends_type_clause. A parameterized one
+      // (`generic_type`) is named by its `name` field: the index holds `Store`,
+      // never `Store<T>`.
+      if (child.type === 'extends_type_clause') {
+        for (const target of child.childrenForFieldName('type')) {
+          if (!target) continue;
+          const named = target.type === 'generic_type' ? getChildByField(target, 'name') ?? target : target;
+          this.unresolvedReferences.push({
+            fromNodeId: classId,
+            referenceName: getNodeText(named, this.source),
+            referenceKind: 'extends',
+            line: target.startPosition.row + 1,
+            column: target.startPosition.column,
+          });
         }
       }
 
