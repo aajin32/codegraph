@@ -21,10 +21,10 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
+import { isPythonSelfCall, matchJsStoreBindingCall, isUnresolvedJsMemberCall, matchObjectPathCall, thisScopeCaller, isVisibleAcrossFiles, matchReference, matchByFilePath, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, isRustForeignImplCallable, isRustPathCallReachable, rustChainedCallByName, matchRustUseBoundName, CASE_INSENSITIVE_LANGUAGES, isDartMemberRead, matchDartMemberRead, isDartChainLink, matchDartChainLink, isDartAnnotation, matchDartAnnotation, isStdMethodName, isGoUnknownQualified, isGoProjectLocalCall, GO_STDLIB_PACKAGES, isGoBareName, goTypePositionTarget, goDotImportedSupertype, GO_TYPE_KINDS, matchGoAssertedCall, matchGoIndexedCall, matchGoChainedCall, preferGoBuildTwin, isGoAssertedLocal, isGoLocallyBound, isPythonFromImportModule, pythonFunctionModuleAlias, pythonAttrRefResolves, matchPythonTypedLocalCall, isImportShadowedByJsBinding, crossesWorkspaceRoot, isManualMockPath, isTestSuitePath, matchNewReceiverCall, newReceiverClass, NEW_RECEIVER_SHAPE, isGuessedRecordAccessor, matchKotlinReceiverChain } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
-import { isCppSupertypeRef, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
+import { isCppDeclaredTypeRef, isCppSupertypeRef, matchCppDeclaredType, matchCppSupertype, clearCppSupertypeMemos } from './cpp-supertypes';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { clearDartLibraryMemos } from './dart-libraries';
 import { clearVbnetReceiverMemos, isVbMemberRead, isVbPathCall, matchVbMemberRead, matchVbPathCall } from './vbnet-receivers';
@@ -36,16 +36,18 @@ import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { gateDartLocal, clearDartLocalScopeMemos } from './dart-local-scope';
 import { clearCppTypeAliasMemos } from './cpp-type-aliases';
 import { clearCppIncluderMemos } from './cpp-includers';
+import { clearCMacroRenames } from './c-macro-renames';
+import { isObjcDeclaredTypeRef, matchByExactName } from './name-matcher';
 import { clearCFeatureVariantMemos } from './c-feature-variants';
 import { clearAmbientModuleMemos, ambientModuleDeclarations } from './ambient-modules';
 import { matchShopifyThemeFile } from './shopify-themes';
 import { isJsSuperCallLanguage, isJsSuperCallSite, matchJsSuperCall } from './js-super-calls';
 import { CLASS_EXPRESSION_REF_LANGUAGES, isCommonJsExportedClass, isJsClassExpression, writtenIn, type ClassExpressionIndex } from './js-class-expressions';
-import { matchRubyConstantPathRef } from './ruby-constant-paths';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonImportsInScope, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
+import { clearRubyConstantPathMemos, matchRubyConstantPathRef } from './ruby-constant-paths';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolvePhpQualifiedClassRef, resolveTsQualifiedTypeRef, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isDartImportRef, isLuaRequireRef, isJsPathImportRef, isBoundToOutOfRepoImport, reachesAmbientModule, importBindingTail, clearImportResolverMemos, resolveImportPath, isExternalImport, pythonImportsInScope, ESM_IMPORT_LANGUAGES, jsModuleFile, pythonRootFingerprint, pythonReopenScope, pythonScriptModuleScope, pythonPackageImporters, moduleDefaultExport, isJsFamilyFile, isModuleBindingName } from './import-resolver';
 import { ResolverPool, minRefsForPool, shouldEngageAdaptively } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
-import { detectFrameworks, getResolvingFrameworks } from './frameworks';
+import { detectFrameworks, getAllFrameworkResolvers, getResolvingFrameworks } from './frameworks';
 import { clearDeclaredDependencies } from './frameworks/package-deps';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
@@ -443,9 +445,12 @@ export class ReferenceResolver {
   }
 
   /**
-   * Initialize the resolver (detect frameworks, etc.)
+   * Initialize the resolver (detect frameworks, etc.). `frameworks` are the
+   * names detection gave in the process's main thread, for a worker starting
+   * on the same index: a detector may read every source file (Spring, in a
+   * project with none of it), and each worker doing that again added up.
    */
-  initialize(): void {
+  initialize(frameworks?: readonly string[]): void {
     // A full index resolves by the package.json files on disk now, as the
     // fingerprint it stamps says, even in a process that read them earlier.
     this.workspacePackages = undefined;
@@ -453,7 +458,9 @@ export class ReferenceResolver {
     // declared dependencies): clear them first, or a process that read the
     // manifests earlier detects by what they said then (#2519).
     this.clearCaches();
-    this.frameworks = detectFrameworks(this.context);
+    this.frameworks = frameworks
+      ? getAllFrameworkResolvers().filter((f) => frameworks.includes(f.name))
+      : detectFrameworks(this.context);
     this.frameworksByLanguage.clear();
   }
 
@@ -676,6 +683,7 @@ export class ReferenceResolver {
     if (this.context) {
       clearImportResolverMemos(this.context);
       clearNameMatcherMemos(this.context);
+      clearRubyConstantPathMemos(this.context);
       clearCppMacroVisibility(this.context);
       clearSwiftTypeVisibility(this.context);
       clearDartLibraryMemos(this.context);
@@ -686,6 +694,7 @@ export class ReferenceResolver {
       clearCppTypeAliasMemos(this.context);
       clearCppSupertypeMemos(this.context);
       clearCppIncluderMemos(this.context);
+      clearCMacroRenames(this.context);
       clearCFeatureVariantMemos(this.context);
       clearAmbientModuleMemos(this.context);
       clearDeclaredDependencies(this.context);
@@ -1532,6 +1541,12 @@ export class ReferenceResolver {
     }
     if (resolved && (resolved.byName || resolved.resolvedBy === 'exact-match' || resolved.resolvedBy === 'fuzzy') &&
         isGuessedRecordAccessor(resolved, ref, this.context)) return null;
+    // A guess by name stops at a monorepo's own edge. (Asked of the winner: taking
+    // a candidate out of the pool leaves a lone one, and a lone one is an answer.)
+    if (resolved && (resolved.byName || resolved.resolvedBy === 'exact-match' || resolved.resolvedBy === 'fuzzy')) {
+      const target = this.nodeById(resolved.targetNodeId);
+      if (target && crossesWorkspaceRoot(target, ref, this.context)) return null;
+    }
     // A name the calling JS/TS function binds itself (a parameter, a local) in
     // scope at the reference is that binding even when the file imports the
     // name, which the import resolver answers before the matcher's own check.
@@ -1576,6 +1591,12 @@ export class ReferenceResolver {
     // which a framework's heuristics or name matching would take (see
     // ./cpp-supertypes).
     if (isCppSupertypeRef(ref)) return matchCppSupertype(ref, this.context);
+    // So is the type a member of one or an alias is declared with, which only
+    // a type can be: a function or macro of that name is no candidate.
+    if (isCppDeclaredTypeRef(ref, this.context)) return matchCppDeclaredType(ref, this.context);
+    // In Objective-C it is the type of that name the file can see: a function
+    // or variable is no candidate, and neither is a guess by any other strategy.
+    if (isObjcDeclaredTypeRef(ref)) return matchByExactName(ref, this.context);
 
     // A Pascal name written without parentheses (#2514) links only to a
     // routine its scope reaches, or through a receiver to a method of the
@@ -2579,6 +2600,8 @@ export class ReferenceResolver {
     // a 22GB WAL on a 4.6GB DB (migration plan §7a.1).
     parallel?: {
       dbPath: string;
+      /** The workers may take this resolver's frameworks, detected on this same index. */
+      shareFrameworks?: boolean;
       bulkEdgeLoad?: {
         begin: () => void;
         end: () => void | Promise<void>;
@@ -2642,7 +2665,7 @@ export class ReferenceResolver {
     const createPool = (t0: number, why: string): ResolverPool | null => {
       poolEngageTried = true;
       if (!parallel) return null;
-      const p = ResolverPool.tryCreate(parallel.dbPath, this.projectRoot);
+      const p = ResolverPool.tryCreate(parallel.dbPath, this.projectRoot, parallel.shareFrameworks ? this.getDetectedFrameworks() : undefined);
       p?.ready().then(
         () => {
           poolReady = true;
@@ -3155,6 +3178,11 @@ export class ReferenceResolver {
   /** What a sync must re-open after these Python files were added or removed (see `pythonReopenScope`). */
   getPythonReopenScope(changedFiles: string[]): ReturnType<typeof pythonReopenScope> {
     return pythonReopenScope(this.diskContext(), changedFiles);
+  }
+
+  /** What a sync must re-open after these Python files were edited (see `pythonScriptModuleScope`). */
+  getPythonScriptModuleScope(editedFiles: string[]): ReturnType<typeof pythonScriptModuleScope> {
+    return pythonScriptModuleScope(this.context, editedFiles);
   }
 
   /** Importers of Python packages whose `__init__.py` was edited, with the names they bind (see `pythonPackageImporters`). */
