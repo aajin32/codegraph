@@ -11,7 +11,7 @@ import { escapeRegExp, escapesRoot } from '../utils';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { isJsSuperCallSite } from './js-super-calls';
-import { JS_ARRAY_METHODS, JS_BROWSER_HOST_GLOBALS, JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
+import { JS_ARRAY_METHODS, JS_BROWSER_HOST_GLOBALS, JS_BUILT_INS, JS_BUILTIN_METHODS, JS_STANDARD_GLOBALS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
 import { dartImportPrefixes, dartLibrarySees, dartPrefixSees, dartPrivateVisible, inSameDartLibrary } from './dart-libraries';
 import { isDartLocallyBound } from './dart-local-scope';
@@ -291,6 +291,31 @@ export function gateLanguageMatch(
   return result;
 }
 
+/**
+ * A C# method group through a receiver, `worker.Run` in `Task.Run(worker.Run)`
+ * or `Action later = worker.Run;` (#2906): the method of the type the
+ * receiver's declaration gives it (a local, a parameter, a field, a property),
+ * or of the type the receiver names (`Worker.Run`, a static method). Null when
+ * the receiver can't be typed, is typed by a keyword type (its methods are
+ * .NET's), or the type has no method of that name: a property read
+ * (`person.Name`) is captured the same way and links nothing.
+ */
+function matchCsharpMethodGroup(receiver: string, member: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  // Most such values are a property or an enum member (`x.Name`,
+  // `StringComparison.Ordinal`): no project method has the name, so there is
+  // no receiver to type.
+  if (!context.getNodesByName(member).some((n) => n.kind === 'method' && n.language === 'csharp')) return null;
+  let type = /^[A-Za-z_]\w*$/.test(receiver)
+    ? inferLocalReceiverType(receiver, ref, context) ?? inferMemberReceiverType(receiver, ref, context)
+    : null;
+  if (!type && /^[A-Z]\w*$/.test(receiver) &&
+      context.getNodesByName(receiver).some((n) => n.language === 'csharp' && CSHARP_TYPE_KINDS.has(n.kind))) type = receiver;
+  if (!type || /^[a-z]/.test(type)) return null;
+  const found = resolveMethodOnType(type, member, ref, context, 0.9, 'function-ref');
+  const target = found ? context.getNodeById?.(found.targetNodeId) : undefined;
+  return found && target?.kind === 'method' && target.id !== ref.fromNodeId ? found : null;
+}
+
 /** Member values retain their receiver; never break ties by file order (#1820). */
 function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   const dot = ref.referenceName.lastIndexOf('.');
@@ -326,6 +351,10 @@ function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext):
     const node = imported && context.getNodeById?.(imported.targetNodeId);
     return node ? result(context.getNodesByQualifiedName(node.qualifiedName).filter(n => n.filePath === node.filePath)) : null;
   }
+  // A C# method group through a receiver (`Task.Run(worker.Run)`, #2906) is a
+  // method of the receiver's declared type, or of the type it names
+  // (`Worker.Run`), or nothing: never one found by its name alone.
+  if (ref.language === 'csharp') return matchCsharpMethodGroup(receiver, member, ref, context);
   if (ref.language === 'go') {
     if (receiver.includes('.')) return matchGoFieldChainCall(receiver, member, ref, context);
     const decl: GoReceiverDecl = {};
@@ -1613,7 +1642,7 @@ export function matchFunctionRef(
   // resolveOne (resolveThisMemberFnRef) — never by name matching here.
   if (ref.referenceName.startsWith('this.')) return null;
 
-  if ((ref.language === 'python' || ref.language === 'go') && ref.referenceName.includes('.')) {
+  if ((ref.language === 'python' || ref.language === 'go' || ref.language === 'csharp') && ref.referenceName.includes('.')) {
     return matchMemberFunctionRef(ref, context);
   }
 
@@ -2158,6 +2187,77 @@ function isTsTypeInScope(n: Node, ref: UnresolvedRef, context: ResolutionContext
   const declaration = isDeclarationFile(n.filePath) || (isFlowLibrary(n.filePath, scope) && !/\.[cm]?tsx?$/i.test(ref.filePath));
   if ((scope.script && !declaration) || (isTestFile(n.filePath) && !isTestFile(ref.filePath))) return false;
   return scope.globalWords.has(`${n.startLine}:${n.startColumn}`);
+}
+
+/**
+ * The packages that make a project's own exports callable by a bare name with
+ * no import written: Nuxt's auto-imports of `composables/` and `utils/`, and
+ * unplugin-auto-import's.
+ */
+const JS_AUTO_IMPORT_PACKAGES = ['nuxt', 'nuxt3', '@nuxt/kit', 'unplugin-auto-import'];
+
+/**
+ * Whether `ref` calls or constructs a standard global (JS_STANDARD_GLOBALS)
+ * that its ES module neither declares nor imports (#3238): `parseInt(s)`,
+ * `new Response(body)` are the runtime's, never another module's export,
+ * which is reached only through an import that the import resolver has
+ * followed already. Any other name keeps the name match as a fallback. Not
+ * in a script, a file with no import or export, whose top level other scripts
+ * share; nor in a project whose build auto-imports its own exports.
+ */
+function isJsBareGlobalName(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if ((ref.referenceKind !== 'calls' && ref.referenceKind !== 'instantiates') || !JS_FAMILY.has(ref.language) ||
+      !JS_STANDARD_GLOBALS.has(ref.referenceName) || !TS_JS_FILE.test(ref.filePath) ||
+      context.getImportMappings?.(ref.filePath, ref.language)?.some((m) => m.localName === ref.referenceName)) return false;
+  const scope = tsGlobalScope(ref.filePath, context);
+  return !!scope && !scope.script && !scope.importAliases.has(ref.referenceName) &&
+    !JS_AUTO_IMPORT_PACKAGES.some((p) => context.isDeclaredPackage?.(p, ref.filePath) === true) &&
+    isJsWrittenBare(ref, context) && !isJsBoundAtRef(ref, context);
+}
+
+/**
+ * Whether a binding of the name holds where `ref` is written: a declaration,
+ * a parameter, a destructured one (`.then(({ encode }) => encode(x))` after a
+ * dynamic import), as jsBindingAt reads them. Such a name is no global, and
+ * this leaves its call as it was.
+ */
+function isJsBoundAtRef(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const file = jsScopeFile(ref.filePath, context);
+  if (!file) return isLocallyBoundJsName(ref.referenceName, ref.filePath, context);
+  const at = (file.lineStarts[ref.line - 1] ?? file.code.length) + ref.column;
+  return jsBindingAt(ref.referenceName, file, at) !== null;
+}
+
+/**
+ * Whether a call or `new` recorded by a bare name was written so: `parseInt(…)`,
+ * `new Response(…)`. A member recorded by its last name, `this.set(…)` or
+ * `new ctx.Request(…)`, is some object's, which isJsBareGlobalName doesn't
+ * read; nor is a name its column doesn't find.
+ */
+function isJsWrittenBare(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
+  if (ref.referenceKind === 'instantiates') {
+    const made = /^new\s+([\w$.]+)/.exec(line.slice(ref.column));
+    if (made) return made[1] === ref.referenceName;
+  }
+  return line.startsWith(ref.referenceName, ref.column) && !isWrittenQualified(ref, context);
+}
+
+/**
+ * Whether a value a bare global name (isJsBareGlobalName) may be `n`: one of
+ * the file's own, or a global declaration — at a script's top level, directly
+ * inside `declare global`, or one the code hangs on the global object
+ * (`window.helper = …`). A test's or fixture's globals are its tests' only.
+ */
+function isJsValueInScope(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (n.filePath === ref.filePath || !TS_JS_FILE.test(n.filePath)) return true;
+  const scope = tsGlobalScope(n.filePath, context);
+  if (!scope) return true;
+  if (isTestFile(n.filePath) && !isTestFile(ref.filePath)) return false;
+  if (scope.globalWords.has(`${n.startLine}:${n.startColumn}`)) return true;
+  // `window.helper = function helper() {…}`: a global wherever it is written.
+  const line = context.getFileLines?.(n.filePath)?.[n.startLine - 1] ?? context.readFile(n.filePath)?.split(/\r?\n/)[n.startLine - 1] ?? '';
+  return new RegExp(`(?:^|[^\\w$.])(?:window|globalThis|global|self)\\s*\\.\\s*${escapeRegExp(n.name)}\\s*=(?!=)`).test(line);
 }
 
 /**
@@ -5509,7 +5609,9 @@ const DART_CONSTRUCTORS = new WeakMap<ResolutionContext, Map<string, boolean>>()
  * Foo.of(…)`, `const Foo.value(…)`, `const factory Foo.x() = _X;` — read from
  * its declaration. Dart reaches one only through its class (`Foo.value(…)`,
  * the tear-off `Foo.value`), never by a bare name: a parameter `value` passed
- * on is not `const BlocProvider.value(…)`.
+ * on is not `const BlocProvider.value(…)`. Dart 3.13 also writes one without
+ * its class: `new named(…)`, `factory make(…)`, and a primary constructor's
+ * `class Point.origin(…)`, whose method starts at `.origin` (#3270).
  */
 function isDartConstructor(n: Node, context: ResolutionContext): boolean {
   if (n.language !== 'dart' || n.kind !== 'method') return false;
@@ -5521,8 +5623,10 @@ function isDartConstructor(n: Node, context: ResolutionContext): boolean {
   const owner = cut > 0 ? n.qualifiedName.slice(0, cut).split('::').pop()! : '';
   const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
   const head = (lines[n.startLine - 1] ?? '').slice(n.startColumn);
-  const constructor = owner !== '' &&
-    new RegExp(String.raw`^(?:(?:const|factory|external)\s+)*${escapeRegExp(owner)}\s*\.\s*${escapeRegExp(n.name)}(?![\w$])`).test(head);
+  const name = escapeRegExp(n.name);
+  const constructor = owner !== '' && (
+    new RegExp(String.raw`^(?:(?:const|factory|external)\s+)*${escapeRegExp(owner)}\s*\.\s*${name}(?![\w$])`).test(head) ||
+    new RegExp(String.raw`^(?:(?:const|external)\s+)*(?:new|factory)\s+${name}(?![\w$])|^\.\s*${name}\s*\(`).test(head));
   memo.set(n.id, constructor);
   return constructor;
 }
@@ -15242,7 +15346,12 @@ const LOCAL_BINDING_PATTERNS = new Map<string, LocalBindingPatterns>();
 const LOCAL_BINDING_PATTERNS_CAP = 4096;
 const JS_BINDING_NAME = /^[\w$]+$/;
 const ARROW_HEAD_CHAR = /[\w$.]/;
-const IMPORT_BINDING_VALUE = /^\s*(?:await\s+)?(?:require|import)\s*\(/;
+/**
+ * A declaration's value that binds an import: `require('./m')`, `await
+ * import('./m')`. Not a required module's export called on the spot,
+ * `require('./app')(opts)`: that is a local holding the call's result.
+ */
+const IMPORT_BINDING_VALUE = /^\s*(?:await\s+)?(?:import\s*\(|require\s*\((?!\s*(['"])[^'"\n]*\1\s*\)\s*\())/;
 
 // The balanced groups a parameter's type or default can hold, two levels deep.
 const PARAM_PAREN = '\\((?:[^()]|\\([^()]*\\))*\\)';
@@ -15415,7 +15524,7 @@ function jsDeclarationsInScope(candidates: Node[], ref: UnresolvedRef, context: 
   return candidates.filter((n) => {
     if (n.filePath !== ref.filePath) return true;
     const site = sites.find((s) => (s.kind === 'function' || s.kind === 'declaration') && jsLineOf(file, s.at) === n.startLine);
-    if (!site || file.code.startsWith('var', site.at) || (site.kind === 'function' && isJsExpressionAt(file.code, site.at))) return true;
+    if (!site || file.code.startsWith('var', site.decl ?? site.at) || (site.kind === 'function' && isJsExpressionAt(file.code, site.at))) return true;
     return site.from <= at && site.to >= at;
   });
 }
@@ -15813,6 +15922,8 @@ export function matchByExactName(
   // Every candidate uses the same binding key. Keep this check lazy.
   let locallyBoundJsName: boolean | undefined;
   const tsBareTypeName = (): boolean => (bareTypeName ??= isTsBareTypeName(ref, context));
+  let bareGlobalName: boolean | undefined;
+  const jsBareGlobalName = (): boolean => (bareGlobalName ??= isJsBareGlobalName(ref, context));
   const ambientDeclarations = ambientModuleDeclarations(context);
   const sameName = outOfRepoCall
     ? innerScopeShadows(context.getNodesByName(ref.referenceName), ref, context)
@@ -15932,6 +16043,9 @@ export function matchByExactName(
     // its own or a global, never another module's — ahead of the ranking, so
     // a global `interface Window` in a `declare global` still wins.
     !(n.filePath !== ref.filePath && tsBareTypeName() && !isTsTypeInScope(n, ref, context)) &&
+    // So is a call or `new` of a bare name the module doesn't import: a
+    // global's, `parseInt` or `Response`, never another module's export (#3238).
+    !(n.filePath !== ref.filePath && jsBareGlobalName() && !isJsValueInScope(n, ref, context)) &&
     // Nor is a `declare module` block a file can't see any candidate, ahead of
     // the ranking, where the gate on the winner would drop the reference: a
     // sibling's test stub's `createRef` is no rival to `packages/react`'s own.
@@ -16808,12 +16922,13 @@ function holderExtentOf(container: Node, lines: string[]): { lines: string[]; ex
 /**
  * The own members of the object literal a holder's `code` (see holderExtent)
  * initializes it with, as spans of that text, one per top-level comma;
- * undefined when the holder isn't written `name = { … }` (optionally inside
- * `Object.freeze(…)` / `Object.seal(…)`).
+ * undefined unless the holder is written `name = { … }` (optionally inside
+ * `Object.freeze(…)` / `Object.seal(…)`) or is the object a module
+ * default-exports, `export default { … }` (#3393).
  */
 function objectLiteralMemberSpans(code: string): Array<{ start: number; end: number }> | undefined {
   // Start at THIS declarator, including its columns, never a sibling on the same line.
-  const open = /^[^=]*=\s*(?:(?:Object\.(?:freeze|seal)\s*)?\(\s*)*\{/.exec(code);
+  const open = /^(?:export\s+default\s*|[^=]*=\s*)(?:(?:Object\.(?:freeze|seal)\s*)?\(\s*)*\{/.exec(code);
   if (!open) return undefined;
 
   const members: Array<{ start: number; end: number }> = [];
@@ -25314,7 +25429,16 @@ interface JsScopeFile {
   arrowEnds?: Map<number, number>;
   /** Per callback's parameter list offset, its callee and argument position (jsCallbackCall + jsCalledFunction). */
   callees?: Map<number, { callee: Node; index: number } | null>;
+  /** Per name, what every `const`/`let`/`var` of the file declares (jsDeclaredNames), read when first asked. */
+  declared?: Map<string, JsDeclaredName[]>;
 }
+
+/**
+ * A name a `const`/`let`/`var` declares: its own offset (`at`), the keyword's
+ * (`decl`), whether the declarator is the name alone (`plain`, not a
+ * destructuring) and where its `=` value starts, or null without one.
+ */
+type JsDeclaredName = { at: number; decl: number; plain: boolean; value: number | null };
 
 /**
  * A binding of a name: where it holds (`from`, its block's `{` or its body's
@@ -25330,6 +25454,8 @@ interface JsBindingSite {
   to: number;
   at: number;
   kind: 'declaration' | 'parameter' | 'function' | 'other';
+  /** A later declarator's declaration keyword (jsDeclaredNames), whose `at` is the declarator's own name. */
+  decl?: number;
   reading?: JsBindingReading | null;
   /** What jsReceiverReadElsewhere reads for the binding, and where an assignment would start to matter. */
   elsewhere?: { read: JsReadElsewhere; from: number } | null;
@@ -25433,14 +25559,17 @@ function jsBindingSites(name: string, file: JsScopeFile): JsBindingSite[] {
     const scope = file.scopes[jsScopeAt(file, at)]!;
     return { from: scope.start, to: scope.end };
   };
+  const inForHead = (at: number) => /\bfor\s*(?:await\s*)?\(\s*$/.test(code.slice(Math.max(0, at - 16), at));
   let resume = 0;
+  const matched = new Set<number>();
   for (const at of file.varDecls) {
     if (at < resume) continue;
     decl.lastIndex = at;
     const m = decl.exec(code);
     if (!m) continue;
     resume = at + m[0].length;
-    if (/\bfor\s*(?:await\s*)?\(\s*$/.test(code.slice(Math.max(0, at - 16), at))) {
+    matched.add(at);
+    if (inForHead(at)) {
       // A `for` head's binding holds in the head and the statement after it.
       sites.push({ from: code.lastIndexOf('(', at), to: jsForStatementEnd(code, at), at, kind: 'other' });
       continue;
@@ -25448,6 +25577,19 @@ function jsBindingSites(name: string, file: JsScopeFile): JsBindingSite[] {
     // `const x = require('./x')` binds an import, which the file's imports answer for.
     const plain = !/^(?:const|let|var)\s+[{[]/.test(m[0]) && !IMPORT_BINDING_VALUE.test(m[1] ?? '');
     sites.push({ ...blockOf(at), at, kind: plain ? 'declaration' : 'other' });
+  }
+  // What the pattern reads only from the keyword, the name as the first
+  // declarator or in a destructuring with no default, misses: a later
+  // declarator (`let n = 0, ob = make()`) and a destructured name beside a
+  // default (`const { ob = make() } = o`). Each is written at its own offset.
+  for (const d of jsDeclaredNames(file).get(name) ?? []) {
+    if (matched.has(d.decl)) continue;
+    if (inForHead(d.decl)) {
+      sites.push({ from: code.lastIndexOf('(', d.decl), to: jsForStatementEnd(code, d.decl), at: d.at, kind: 'other', decl: d.decl });
+      continue;
+    }
+    const plain = d.plain && !(d.value !== null && IMPORT_BINDING_VALUE.test(code.slice(d.value, d.value + 40)));
+    sites.push({ ...blockOf(d.decl), at: d.at, kind: plain ? 'declaration' : 'other', decl: d.decl });
   }
   for (const at of file.fnDecls) {
     fn.lastIndex = at;
@@ -25493,6 +25635,266 @@ function jsBindingSites(name: string, file: JsScopeFile): JsBindingSite[] {
   }
   file.bindings.set(name, sites);
   return sites;
+}
+
+/**
+ * Every name the file's `const`/`let`/`var` declarations declare, by name
+ * (JsDeclaredName), read once per file. A declaration is read declarator by
+ * declarator: a name or a destructuring pattern, an optional type and `=`
+ * value, then a comma for the next one (#3293). It stops where the reading
+ * can't follow the code — a value holding a JSX element, whose text can hold
+ * commas of its own — keeping what it read before.
+ */
+function jsDeclaredNames(file: JsScopeFile): Map<string, JsDeclaredName[]> {
+  if (file.declared) return file.declared;
+  const declared = new Map<string, JsDeclaredName[]>();
+  const add = (name: string, d: JsDeclaredName) => {
+    const list = declared.get(name);
+    if (list) list.push(d); else declared.set(name, [d]);
+  };
+  const { code } = file;
+  for (const decl of file.varDecls) {
+    let i = decl;
+    while (i < code.length && /[a-z]/.test(code[i]!)) i++;
+    // Each declarator reads at least its name and the comma after it.
+    while (true) {
+      i = jsSkipSpace(code, i);
+      const found: { name: string; at: number }[] = [];
+      let plain = false;
+      if (code[i] === '{' || code[i] === '[') {
+        const close = jsMatchingBracket(code, i);
+        if (close < 0 || !jsPatternNames(code, i, close, found)) break;
+        i = close + 1;
+      } else {
+        JS_NAME_AT.lastIndex = i;
+        const id = JS_NAME_AT.exec(code);
+        if (!id) break;
+        found.push({ name: id[0], at: i });
+        plain = true;
+        i += id[0].length;
+      }
+      // What follows a declarator's name or pattern on its line: its type, its
+      // value, a comma before the next one, or the end of the declaration.
+      i = jsSkipSpace(code, i, false);
+      if (code[i] === '!' && code[jsSkipSpace(code, i + 1, false)] === ':') i = jsSkipSpace(code, i + 1, false);
+      if (code[i] === '\n' || code[i] === '\r') {
+        // The next line carries the declaration on only with a comma or a value.
+        const next = jsSkipSpace(code, i);
+        if (code[next] === ',' || (code[next] === '=' && !/[=>]/.test(code[next + 1] ?? ''))) i = next;
+      }
+      if (code[i] === ':') {
+        i = jsTypeEnd(code, i + 1);
+        if (i < 0) break;
+      }
+      let value: number | null = null;
+      if (code[i] === '=' && !/[=>]/.test(code[i + 1] ?? '')) {
+        value = i + 1;
+        i = jsDeclaratorValueEnd(file, value);
+        if (i < 0) {
+          for (const f of found) add(f.name, { at: f.at, decl, plain, value });
+          break;
+        }
+      } else if (!(i >= code.length || /[,;)\r\n}]/.test(code[i]!) || /^(?:of|in)(?![\w$])/.test(code.slice(i, i + 3)))) {
+        break;
+      }
+      for (const f of found) add(f.name, { at: f.at, decl, plain, value });
+      if (code[i] !== ',') break;
+      i++;
+    }
+  }
+  file.declared = declared;
+  return declared;
+}
+
+const JS_NAME_AT = /[A-Za-z_$][\w$]*/y;
+const JS_KEY_AT = /[\w$]+/y;
+
+/** The first offset at or after `i` that holds no whitespace (no line break either, when `lines` is false). */
+function jsSkipSpace(code: string, i: number, lines = true): number {
+  while (i < code.length) {
+    const c = code[i]!;
+    if (c === ' ' || c === '\t' || (lines && (c === '\n' || c === '\r'))) i++;
+    else break;
+  }
+  return i;
+}
+
+/** Where the `(`, `[` or `{` at `open` closes, counting all three kinds, or -1 when it doesn't. */
+function jsMatchingBracket(code: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < code.length; i++) {
+    const c = code[i];
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if ((c === ')' || c === ']' || c === '}') && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * The names a destructuring pattern `code[open..close]` binds, into `out`:
+ * shorthand and renamed properties, elements, rest names and nested patterns,
+ * past each default (`{ ob = make(), b: [c] }` binds `ob` and `c`). False when
+ * the pattern holds something it doesn't read.
+ */
+function jsPatternNames(code: string, open: number, close: number, out: { name: string; at: number }[], depth = 0): boolean {
+  if (depth > 32) return false;
+  const object = code[open] === '{';
+  let i = open + 1;
+  while (true) {
+    i = jsSkipSpace(code, i);
+    while (code[i] === ',') i = jsSkipSpace(code, i + 1);
+    if (i >= close) return true;
+    if (code.startsWith('...', i)) i = jsSkipSpace(code, i + 3);
+    if (object) {
+      // The property's key: a name, a quoted or computed key, or a number.
+      let key: string | null = null;
+      const keyAt = i;
+      if (code[i] === '[') {
+        i = jsMatchingBracket(code, i);
+        if (i < 0 || i > close) return false;
+        i++;
+      } else if (code[i] === '"' || code[i] === "'") {
+        const end = code.indexOf(code[i]!, i + 1);
+        if (end < 0 || end > close) return false;
+        i = end + 1;
+      } else {
+        JS_KEY_AT.lastIndex = i;
+        const k = JS_KEY_AT.exec(code);
+        if (!k) return false;
+        key = k[0];
+        i += key.length;
+      }
+      i = jsSkipSpace(code, i);
+      if (code[i] === ':') {
+        i = jsSkipSpace(code, i + 1);
+      } else {
+        // Shorthand: the key is the name it binds.
+        if (key === null || !/^[A-Za-z_$]/.test(key)) return false;
+        out.push({ name: key, at: keyAt });
+        i = jsPatternDefaultEnd(code, i, close);
+        if (i < 0) return false;
+        continue;
+      }
+    }
+    // The binding target: a name or a nested pattern.
+    if (code[i] === '{' || code[i] === '[') {
+      const end = jsMatchingBracket(code, i);
+      if (end < 0 || end > close || !jsPatternNames(code, i, end, out, depth + 1)) return false;
+      i = end + 1;
+    } else {
+      JS_NAME_AT.lastIndex = i;
+      const id = JS_NAME_AT.exec(code);
+      if (!id) return false;
+      out.push({ name: id[0], at: i });
+      i += id[0].length;
+    }
+    i = jsPatternDefaultEnd(code, i, close);
+    if (i < 0) return false;
+  }
+}
+
+/**
+ * Past an element's default (`= make()`) at `i` in a destructuring pattern
+ * that closes at `close`: the offset of the comma or the close that follows
+ * the element, or -1 when something else does.
+ */
+function jsPatternDefaultEnd(code: string, i: number, close: number): number {
+  i = jsSkipSpace(code, i);
+  if (code[i] === '=' && !/[=>]/.test(code[i + 1] ?? '')) {
+    let depth = 0;
+    for (i++; i < close; i++) {
+      const c = code[i];
+      if (c === '(' || c === '[' || c === '{') depth++;
+      else if (c === ')' || c === ']' || c === '}') depth--;
+      else if (c === ',' && depth === 0) break;
+    }
+  }
+  return i >= close || code[i] === ',' ? i : -1;
+}
+
+/**
+ * Past a declarator's type annotation that starts at `i` (after its `:`):
+ * the `=` before its value, or the comma, semicolon or line break that ends
+ * it, with brackets, angle brackets and a function type's `=>` read as part
+ * of the type. A line starting with `|`, `&` or `=` carries it on. -1 when
+ * it doesn't end.
+ */
+function jsTypeEnd(code: string, i: number): number {
+  let depth = 0;
+  for (; i < code.length; i++) {
+    const c = code[i]!;
+    if (c === '=' && code[i + 1] === '>') i++;
+    else if (c === '=' && depth === 0) return i;
+    else if (c === '(' || c === '[' || c === '{' || c === '<') depth++;
+    else if (c === ')' || c === ']' || c === '}' || c === '>') {
+      if (--depth < 0) return i;
+    } else if (depth === 0 && (c === ',' || c === ';')) return i;
+    else if (depth === 0 && c === '\n') {
+      const next = jsSkipSpace(code, i);
+      if (!/[|&=]/.test(code[next] ?? '')) return i;
+      i = next - 1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Where the `=` value of a declarator that starts at `i` ends: at the comma
+ * before the next declarator, the semicolon, the bracket closing around the
+ * declaration (a `for` head's `)`, a block's `}`), or the line break that
+ * ends the statement where no semicolon does (as jsBodyEnd reads it). A `{`
+ * is skipped to its scope's end, type arguments before a call's `(` are read
+ * past. -1 when the value can't be read: an element (`<p>Hi, ob</p>`) or an
+ * unclosed bracket.
+ */
+function jsDeclaratorValueEnd(file: JsScopeFile, i: number): number {
+  const { code } = file;
+  let depth = 0;
+  for (; i < code.length; i++) {
+    const c = code[i]!;
+    if (c === '{') {
+      const end = jsScopeEnd(file, i);
+      if (end < 0) return -1;
+      i = end;
+    } else if (c === '(' || c === '[') {
+      depth++;
+    } else if (c === ')' || c === ']' || c === '}') {
+      if (depth === 0) return i;
+      depth--;
+    } else if (depth > 0) {
+      continue;
+    } else if (c === ',' || c === ';') {
+      return i;
+    } else if (c === '<') {
+      const before = jsPrevNonSpace(code, i);
+      if (before < 0 || !JS_OPERAND_END.test(code[before]!)) return -1;
+      JS_CALL_TYPE_ARGUMENTS.lastIndex = i;
+      const typed = JS_CALL_TYPE_ARGUMENTS.exec(code);
+      if (typed) i += typed[0].length - 1;
+    } else if (c === '\n') {
+      const before = jsPrevNonSpace(code, i);
+      const after = jsSkipSpace(code, i);
+      if (JS_OPERAND_END.test(code[before] ?? '') && (after === code.length || JS_OPERAND_START.test(code[after]!))) return i;
+      i = after - 1;
+    }
+  }
+  return code.length;
+}
+
+/** Type arguments on one line before a call's or `new`'s `(`: `<string, number>`, one level of nesting. */
+const JS_CALL_TYPE_ARGUMENTS = /<(?:[\w$. \t,|&[\]'"?]|<[\w$. \t,|&[\]'"?]{0,200}>){0,200}>(?=[ \t]*\()/y;
+
+/** Where the scope the `{` at `open` starts ends, or -1 when it doesn't close. */
+function jsScopeEnd(file: JsScopeFile, open: number): number {
+  const { scopes } = file;
+  let lo = 1, hi = scopes.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const start = scopes[mid]!.start;
+    if (start === open) return scopes[mid]!.end < file.code.length ? scopes[mid]!.end : -1;
+    if (start < open) lo = mid + 1; else hi = mid - 1;
+  }
+  return -1;
 }
 
 /** Where a `for` statement whose head holds `at` ends: past the statement after its head. */
@@ -25602,7 +26004,8 @@ function jsParameterReading(name: string, site: JsBindingSite, file: JsScopeFile
  */
 function jsDeclarationReading(name: string, site: JsBindingSite, file: JsScopeFile): JsBindingReading | null {
   const { code } = file;
-  const head = new RegExp(`(?:const|let|var)\\s+${escapeRegExp(name)}(?![\\w$])\\s*(?:!?\\s*:\\s*${TS_ANNOTATED_TYPE})?`, 'y');
+  // At the keyword, or at a later declarator's own name (jsDeclaredNames).
+  const head = new RegExp(`(?:(?:const|let|var)\\s+)?${escapeRegExp(name)}(?![\\w$])\\s*(?:!?\\s*:\\s*${TS_ANNOTATED_TYPE})?`, 'y');
   head.lastIndex = site.at;
   const m = head.exec(code);
   if (!m) return null;
@@ -25982,6 +26385,26 @@ const JS_CALL_DECLARATION = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:([A
 /** Bare calls whose value no project function's signature gives. */
 const JS_NOT_TYPED_CALLEE = new Set(['require', 'import', 'await', 'typeof', 'new', 'function', 'async', 'super']);
 
+/** `require('./app')(` opening a value: a project module's export, called. Group 2 is the specifier. */
+const JS_CALLED_REQUIRE = /^require\s*\(\s*(['"])(\.[^'"]*)\1\s*\)\s*\(/;
+
+/**
+ * The function a project module exports as the whole module or its default
+ * (`module.exports = create`, `export default function create`), which
+ * `require('./m')(…)` calls; null unless the index holds one function of the
+ * name there.
+ */
+function requiredModuleFunction(specifier: string, where: UnresolvedRef, context: ResolutionContext): Node | null {
+  const file = context.resolveModuleFile?.(specifier, where.filePath, where.language);
+  if (!file) return null;
+  const source = context.readFile(file) ?? '';
+  const name = /(?:^|[^\w$.])module\.exports\s*=\s*(?:(?:async\s+)?function\s*\*?\s*)?([A-Za-z_$][\w$]*)\s*[;(\r\n]/m.exec(source)?.[1] ??
+    /^[ \t]*export\s+default\s+(?:(?:async\s+)?function\s*\*?\s*)?([A-Za-z_$][\w$]*)/m.exec(source)?.[1];
+  if (!name) return null;
+  const fns = (context.getNodesInFileNamed?.(file, name) ?? context.getNodesInFile(file)).filter((n) => n.kind === 'function' && n.name === name);
+  return fns.length === 1 && fns[0]!.signature && ESM_FAMILY.has(fns[0]!.language) ? fns[0]! : null;
+}
+
 /**
  * The names a JS/TS file may type from another declaration's signature
  * (jsReceiverReadElsewhere), read off the raw text at the file's arrows,
@@ -26016,7 +26439,10 @@ function jsReceiverCandidates(filePath: string, language: Language, context: Res
   for (const at of sites.varDecls) {
     JS_CALL_DECLARATION.lastIndex = at;
     const m = JS_CALL_DECLARATION.exec(source);
-    if (m && !(m[2] && (JS_NOT_TYPED_CALLEE.has(m[2]) || !callees.has(m[2])))) calls.add(m[1]!);
+    // `require('./app')(opts)`: what the module's function returns (tsValueType).
+    const calledRequire = m?.[2] === 'require' &&
+      JS_CALLED_REQUIRE.test(source.slice(at + m[0].lastIndexOf('require'), at + m[0].length + 300));
+    if (m && (calledRequire || !(m[2] && (JS_NOT_TYPED_CALLEE.has(m[2]) || !callees.has(m[2]))))) calls.add(m[1]!);
   }
   // A function at `fnStart` with parameters in source[open..close], when a
   // call by a bare name the file imports or declares takes it: its untyped
@@ -26322,7 +26748,18 @@ function tsValueType(file: JsScopeFile, at: number, where: UnresolvedRef, contex
   if (!match || (top && made)) return null;
   const open = at + lead + match[0].length - 1;
   const close = jsCloseOf(code, open);
-  if (close < 0 || !JS_WHOLE_VALUE_END.test(code.slice(close + 1, close + 200))) return null;
+  if (close < 0) return null;
+  // `require('./app')(opts)`: what the function the module exports returns.
+  if (!made && called![1] === 'require' && !called![2]) {
+    const required = JS_CALLED_REQUIRE.exec((context.readFile(where.filePath) ?? '').slice(at + lead, at + lead + 300));
+    const callOpen = required ? at + lead + required[0].length - 1 : -1;
+    const callClose = callOpen < 0 ? -1 : jsCloseOf(code, callOpen);
+    if (callClose < 0 || !JS_WHOLE_VALUE_END.test(code.slice(callClose + 1, callClose + 200))) return null;
+    const fn = requiredModuleFunction(required![2]!, where, context);
+    const read = fn ? tsReturnedType(fn, context, walk) : null;
+    return read && { ...read, from: [...read.from, fn!.filePath] };
+  }
+  if (!JS_WHOLE_VALUE_END.test(code.slice(close + 1, close + 200))) return null;
   if (made) {
     const raw = made[1]!.replace(/\s+/g, '');
     // `new Backend(root)` of a parameter or a local names no class (jsDeclarationReading).
@@ -26389,8 +26826,11 @@ function jsCallResultReading(
   };
 }
 
-/** A `const`/`let`/`var` of one name and its `=`, matched at the keyword: the head jsCallResultReading reads past. */
-const JS_DECLARATION_HEAD = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*/y;
+/**
+ * A `const`/`let`/`var` of one name and its `=`, matched at the keyword, or
+ * at a later declarator's own name: the head jsCallResultReading reads past.
+ */
+const JS_DECLARATION_HEAD = /(?:(?:const|let|var)\s+)?([A-Za-z_$][\w$]*)\s*=\s*/y;
 
 /**
  * The type a TS class's static method `name` says it returns, read where that
@@ -27951,6 +28391,12 @@ function matchMethodCallOn(
       (isImportedModuleReceiver(objectOrClass!, ref, context) || isImportedFunctionReceiver(objectOrClass!, ref, context))) {
     return null;
   }
+  // So is the default binding of a module of the project's own (#3272).
+  if (ref.referenceKind === 'calls' && JS_FAMILY.has(ref.language)) {
+    const ownModule = projectModuleDefaultBinding(objectOrClass!, ref, context);
+    const settled = ownModule ? projectModuleMemberCall(ownModule, methodName!, ref, context) : undefined;
+    if (settled !== undefined) return settled;
+  }
 
   // A receiver written as a type name the project doesn't declare
   // (`Exception.Create(…)` in Delphi, `Collections.sort(…)`) is a type from
@@ -28391,6 +28837,54 @@ function isImportedModuleReceiver(receiver: string, ref: UnresolvedRef, context:
   if (binding.isDefault || !JS_FAMILY.has(ref.language)) return false;
   const bound = context.resolveImport?.({ ...ref, referenceName: root, referenceKind: 'imports' });
   return !!bound && context.getNodeById?.(bound.targetNodeId)?.kind === 'file';
+}
+
+/**
+ * The project module a member call's receiver is the default binding of,
+ * called on directly: `utils` in `utils.missing()` after `const utils =
+ * require('./utils')`, or a default import of the module. Null for any other
+ * receiver.
+ */
+function projectModuleDefaultBinding(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  if (receiver.includes('.')) return null;
+  const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === receiver);
+  if (!binding?.isDefault || binding.isNamespace) return null;
+  // A parameter or local of the name in scope at the call is the receiver
+  // instead, as isImportBinding reads it (#2953).
+  if (isLocallyBoundJsName(receiver, ref.filePath, context) && jsBindingAroundReference(receiver, ref, context)) return null;
+  const file = context.resolveModuleFile?.(binding.source, ref.filePath, ref.language);
+  return file && (context.isIndexedFile?.(file) ?? context.fileExists(file)) ? file : null;
+}
+
+/** `module.exports = …`, not `module.exports.x = …`: the module states a default. */
+const MODULE_EXPORTS_DEFAULT = /(?:^|[^\w$.])module\.exports\s*=(?![=>])\s*(new\s+([A-Za-z_$][\w$]*)\s*[(<;\r\n]|\{)?/m;
+/** An ES module's default: `export default …`, `export { x as default }`, `export = …`. */
+const ESM_DEFAULT_EXPORT_STATEMENT = /^[ \t]*export\s+(?:default\b|=)|\bas\s+default\b/m;
+
+/**
+ * A member called on a project module's default binding that the import
+ * resolver didn't place (#3272), when that settles it: `undefined` leaves the
+ * call to the guesses below, as before. The resolver has read what the
+ * module exports under the name, so where the module states no default — a
+ * bag of `exports.x = …`, which the binding is the whole of — or states an
+ * object literal, whose members it reads, the member is none of the
+ * module's, and a method of some class elsewhere, picked by its name alone,
+ * is no answer: `utils.missing()` linked a `Decoy` class's `missing`. A
+ * default the module makes with `new` (`module.exports = new Panel()`) has
+ * the members of its class, which the module file declares or imports.
+ */
+function projectModuleMemberCall(file: string, methodName: string, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null | undefined {
+  const source = context.readFile(file) ?? '';
+  const commonJs = source.includes('module.exports') ? MODULE_EXPORTS_DEFAULT.exec(source) : null;
+  const made = commonJs?.[2];
+  if (made) {
+    const language = context.getNodesInFile(file)[0]?.language ?? ref.language;
+    const declaring = tsImportedTypeFile(made, { ...ref, filePath: file, language }, context) ?? file;
+    return resolveMethodOnType(made, methodName, ref, context, 0.85, 'instance-method', declaring);
+  }
+  if (commonJs) return commonJs[1] === '{' ? null : undefined;
+  const esmDefault = (source.includes('default') || source.includes('export =')) && ESM_DEFAULT_EXPORT_STATEMENT.test(source);
+  return esmDefault ? undefined : null;
 }
 
 const JS_ASSIGNED_MEMBERS = new WeakMap<ResolutionContext, Map<string, ReadonlySet<string>>>();
@@ -35570,6 +36064,7 @@ export function matchFuzzy(
         (finalCandidates[0]!.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))) &&
     !(JS_FAMILY.has(ref.language) && isOutOfRepoBinding(ref.referenceName, ref, context)) &&
     !(finalCandidates[0]!.filePath !== ref.filePath && isTsBareTypeName(ref, context) && !isTsTypeInScope(finalCandidates[0]!, ref, context)) &&
+    !(finalCandidates[0]!.filePath !== ref.filePath && isJsBareGlobalName(ref, context) && !isJsValueInScope(finalCandidates[0]!, ref, context)) &&
     !(finalCandidates[0]!.kind === 'method' && isBareGoCall(ref, context)) &&
     // A bare PHP call is a function call (case-insensitive, so fuzzy may find
     // one) — never the class `View` for `view(…)`, never a method.
