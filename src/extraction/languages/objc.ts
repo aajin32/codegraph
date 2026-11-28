@@ -1,5 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getChildByField, getNodeText } from '../tree-sitter-helpers';
+import { getChildByField, getNodeText, namedChildrenOf } from '../tree-sitter-helpers';
 import type { ExtractorContext, LanguageExtractor } from '../tree-sitter-types';
 import {
   blankLoneMacroLines,
@@ -9,10 +9,10 @@ import {
   rewriteFoundationEnumMacros,
   unnamedTypeVariableName,
 } from './c-cpp';
+import { rewriteRctExternShims } from './objc-rn-extern';
 
 function findCompoundStatement(node: SyntaxNode): SyntaxNode | null {
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
+  for (const child of namedChildrenOf(node)) {
     if (child?.type === 'compound_statement') {
       return child;
     }
@@ -51,8 +51,7 @@ const OBJC_TYPE_QUALIFIERS = new Set([
 /** Collect the type identifiers under a `method_type`, in document order. */
 function collectTypeIdentifiers(node: SyntaxNode, source: string, out: string[]): void {
   if (node.type === 'type_identifier') out.push(getNodeText(node, source).trim());
-  for (let i = 0; i < node.namedChildCount; i++) {
-    const child = node.namedChild(i);
+  for (const child of node.namedChildren) {
     if (child) collectTypeIdentifiers(child, source, out);
   }
 }
@@ -108,8 +107,12 @@ export const objcExtractor: LanguageExtractor = {
   // `RCT_EXTERN_C_BEGIN`, reads to the parser as the start of a declaration:
   // it swallowed the `typedef` below it, and an `@interface` below it lost
   // its class to error recovery. Blanked as in C, offsets kept. A
-  // `typedef NS_ENUM(NSInteger, Name) {` is rewritten as `enum Name {`.
-  preParse: (source) => blankLoneMacroLines(rewriteFoundationEnumMacros(source), OBJC_LONE_MACROS),
+  // `typedef NS_ENUM(NSInteger, Name) {` is rewritten as `enum Name {`, and
+  // React Native's shim for a Swift module, `@interface
+  // RCT_EXTERN_MODULE(Name, Super)` and the macros under it, as the
+  // implementation of `Name` it expands to (objc-rn-extern.ts).
+  preParse: (source) =>
+    blankLoneMacroLines(rewriteFoundationEnumMacros(rewriteRctExternShims(source)), OBJC_LONE_MACROS),
   functionTypes: ['function_definition'],
   // Only @interface emits a class node; @implementation reuses it via visitNode.
   classTypes: ['class_interface'],
@@ -149,8 +152,7 @@ export const objcExtractor: LanguageExtractor = {
     return findCompoundStatement(node);
   },
   resolveTypeAliasKind: (node, _source) => {
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const child of namedChildrenOf(node)) {
       if (!child) continue;
       if (child.type === 'enum_specifier' && getChildByField(child, 'body')) return 'enum';
       if (child.type === 'struct_specifier' && getChildByField(child, 'body'))
@@ -174,11 +176,9 @@ export const objcExtractor: LanguageExtractor = {
     if (!classNode) return true;
 
     ctx.pushScope(classNode.id);
-    for (let i = 0; i < node.namedChildCount; i++) {
-      const child = node.namedChild(i);
+    for (const child of node.namedChildren) {
       if (child?.type === 'implementation_definition') {
-        for (let j = 0; j < child.namedChildCount; j++) {
-          const implChild = child.namedChild(j);
+        for (const implChild of child.namedChildren) {
           if (implChild) ctx.visitNode(implChild);
         }
       }
